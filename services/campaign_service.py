@@ -10,7 +10,7 @@ from integrations.indihomes_client import IndihomesClient
 from integrations.wati_client import WatiClient
 from models.campaign import CampaignRecord
 from models.lead import Lead
-from services import property_service, template_service
+from services import campaign_context, property_service, template_service
 from utils.constants import CampaignStatus
 from utils.logger import get_logger
 
@@ -34,6 +34,12 @@ async def process_lead(
             record.mark_failed("property not resolved", backoff_seconds=15 * 60)
             return record
         record.status = CampaignStatus.PROPERTY_RESOLVED
+
+        # Remembered so routes/campaign.py's POST /property-detail can
+        # resolve the right project later purely from phone, even if
+        # the WATI flow calls back before a project_code contact
+        # attribute is set on the contact.
+        campaign_context.remember(lead.phone, prop.project_code)
 
         payload = template_service.build_template_payload(lead, prop)
         await wati_client.send_template(payload["phone"], payload["template_name"], payload["parameters"])

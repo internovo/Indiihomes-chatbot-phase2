@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from config import get_settings
 from integrations.indihomes_client import get_indihomes_client
 from integrations.wati_client import get_wati_client
-from routes import health, webhook
+from routes import campaign, health, webhook
 from utils.logger import get_logger
 from workers import campaign_worker, cleanup_worker, retry_worker
 
@@ -55,3 +55,4 @@ app = FastAPI(title="IndiHomes Phase 2 Campaign Service", lifespan=lifespan)
 
 app.include_router(health.router)
 app.include_router(webhook.router)
+app.include_router(campaign.router)

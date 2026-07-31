@@ -19,7 +19,14 @@ def format_date(value: str | None, fmt_out: str = "%d %b %Y") -> str:
     """Best-effort date formatting for display in WhatsApp messages.
     Falls back to the raw string if it can't be parsed rather than
     raising - a badly formatted date is not worth crashing a worker
-    cycle over."""
+    cycle over.
+
+    "%Y-%m" (e.g. "2028-01") covers the real backend's
+    possessionStartDate field, which is month-precision only (no day) -
+    formatted as month/year rather than day/month/year in that case,
+    since a fabricated "01" day would misleadingly imply day-level
+    precision that isn't in the source data.
+    """
     if not value:
         return ""
     for fmt_in in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%d/%m/%Y"):
@@ -27,6 +34,10 @@ def format_date(value: str | None, fmt_out: str = "%d %b %Y") -> str:
             return datetime.strptime(value, fmt_in).strftime(fmt_out)
         except ValueError:
             continue
+    try:
+        return datetime.strptime(value, "%Y-%m").strftime("%b %Y")
+    except ValueError:
+        pass
     return value
 
 

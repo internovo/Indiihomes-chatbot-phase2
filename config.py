@@ -28,6 +28,15 @@ class Settings(BaseSettings):
     # checkpoint from pulling the entire historical lead list.
     initial_lookback_hours: int = 24
 
+    # --- Advisor email notifications (POST /notify-advisor) ---
+    # Brevo's HTTPS API only - see integrations/email_client.py for why
+    # (works identically locally and on Railway; SMTP does not).
+    brevo_api_key: str = ""
+    email_from: str = ""
+    email_from_name: str = "Indihomes Bookings"
+    advisor_emails: str = ""   # comma-separated, e.g. "a@x.com,b@x.com"
+    notify_cc: str = ""        # comma-separated, optional oversight inbox(es)
+
     # --- Misc ---
     log_level: str = "INFO"
     environment: str = "development"
