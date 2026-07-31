@@ -1,6 +1,14 @@
-"""Builds and sends the advisor-notification email that replaces the
-old save-lead CRM write for the campaign flow's site-visit and
-advisor-handoff branches (team decision - see routes/campaign.py).
+"""Builds and sends the advisor-notification email. Two families of
+callers:
+
+1. routes/campaign.py's POST /notify-advisor - fired by the WATI flow
+   itself when a lead taps "Book a Site Visit" or "Talk to an Advisor".
+2. services/campaign_service.py and workers/retry_worker.py - fired
+   directly (no HTTP involved) when a campaign lead can't be
+   auto-processed at all: no project_code/project_name to look up
+   (reason="unresolved_project"), or every retry attempt exhausted
+   (reason="lead_abandoned"). Both would otherwise fail completely
+   silently - the lead just falls out of the pipeline with nobody told.
 
 email_client is an optional parameter (same DI pattern as
 property_service.resolve_property taking an indihomes client) purely
@@ -17,6 +25,8 @@ _REASON_LABELS = {
     "advisor_requested": "wants to talk to an advisor",
     "site_visit_no_slots": "wants a site visit (no slots currently available)",
     "site_visit_booked": "booked a site visit",
+    "unresolved_project": "came in via a campaign source, but has no project_code or project_name to look up - needs manual follow-up",
+    "lead_abandoned": "campaign lead couldn't be processed after all retries - needs manual follow-up",
 }
 
 
@@ -33,6 +43,8 @@ def _body(req: NotifyAdvisorRequest) -> str:
         f"Project: {req.project_name or req.project_code or '(unknown)'}",
         f"Reason: {_REASON_LABELS.get(req.reason, req.reason)}",
     ]
+    if req.lead_source:
+        lines.append(f"Lead source: {req.lead_source}")
     if req.slot_label:
         lines.append(f"Slot: {req.slot_label}")
     if req.advisor:

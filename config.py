@@ -15,7 +15,12 @@ class Settings(BaseSettings):
     # --- WATI ---
     wati_api_key: str = ""
     wati_endpoint: str = "https://live-mt-server.wati.io"
+    # Property Campaign leads (Housing.com / website form) - references a specific project.
     wati_template_name: str = "campaign_property_intro"
+    # Generic Interest leads (Meta Ads / EOI) - no project data, just a
+    # "thanks for your interest" opener that hands off into Phase 1's
+    # qualification flow once the lead taps in.
+    wati_generic_template_name: str = "campaign_generic_intro"
 
     # --- Worker tuning ---
     poll_interval_seconds: int = 45
