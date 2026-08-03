@@ -10,8 +10,17 @@ this mapping independently, which is how a field-name mismatch against
 the REAL backend shape went unnoticed in one path but not the other -
 see the field notes below, confirmed against live
 /fetchPaginatedFilteredProjectList data on 31 Jul 2026.
+
+resolve_raw_project() is the equivalent single source of truth for the
+LOOKUP itself (id -> name -> fuzzy search), added 3 Aug 2026 for the
+same reason: both callers used to run their own independent id/name
+lookup, and centralizing prevents them drifting again. The third tier
+(searchText) exists because a real, live project ("Ariha Opulence")
+had a data-entry typo in its stored displayName ("Ariha  Opulence " -
+double space, trailing space) that an exact-match name lookup can
+never tolerate, but the search endpoint does.
 """
-from typing import Any
+from typing import Any, Optional
 
 from integrations.indihomes_client import IndihomesClient
 from models.lead import Lead
@@ -114,18 +123,42 @@ def raw_to_property(raw: dict, fallback_code: str = "", fallback_name: str = "")
     )
 
 
+async def resolve_raw_project(client: IndihomesClient, code: Optional[str], name: Optional[str]) -> dict | None:
+    """Three-tier lookup, shared by both callers below so they can't
+    drift out of sync with each other again (see module docstring):
+
+    1. fetch_project(code) - works if `code` happens to be the backend's
+       real internal `id`.
+    2. fetch_project_by_name(name) - works for an exact display-name match.
+    3. fetch_filtered_projects({"searchText": name}) - a fuzzy fallback,
+       added after a real project's stored displayName turned out to
+       have a data-entry typo (extra internal whitespace) that step 2's
+       exact match could never tolerate, but the search endpoint does.
+    """
+    raw: dict | None = None
+
+    if code:
+        raw = await client.fetch_project(code)
+
+    if raw is None and name:
+        raw = await client.fetch_project_by_name(name)
+
+    if raw is None and name:
+        results = await client.fetch_filtered_projects({"searchText": name, "limit": 1})
+        if results:
+            raw = results[0]
+            logger.info("Resolved project via searchText fallback for name=%r (exact lookups missed)", name)
+
+    return raw
+
+
 async def resolve_property(client: IndihomesClient, lead: Lead) -> Property | None:
     """Prefers an explicit project_code (the reliable path the plan
     recommends every campaign eventually attach). Falls back to
-    project_name / fetchProjectByName for campaigns that only pass a
-    name today."""
-    raw: dict | None = None
-
-    if lead.project_code:
-        raw = await client.fetch_project(lead.project_code)
-
-    if raw is None and lead.project_name:
-        raw = await client.fetch_project_by_name(lead.project_name)
+    project_name / fetchProjectByName, then a fuzzy search, for
+    campaigns that only pass a name today - or whose stored name has a
+    data-quality issue an exact match can't tolerate."""
+    raw = await resolve_raw_project(client, lead.project_code, lead.project_name)
 
     if raw is None:
         logger.warning(

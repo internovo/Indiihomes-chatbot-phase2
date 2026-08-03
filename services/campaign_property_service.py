@@ -14,15 +14,13 @@ property_service.raw_to_property() is populated from the backend's
 projectCode/projectName field, NOT its `id` field. fetch_project()
 needs `id` specifically (see its docstring in indihomes_client.py) -
 those are different values (confirmed against real data: e.g.
-id="BII0kGNfkFaU" vs projectCode="INV_GW_552"). So a plain
-fetch_project(code) call will almost always come back empty here -
-falls back to fetch_project_by_name(code), mirroring
-property_service.resolve_property()'s two-step lookup.
+id="BII0kGNfkFaU" vs projectCode="INV_GW_552").
 
-Raw JSON -> Property field mapping is shared with property_service.py
-(raw_to_property) rather than duplicated here, after a real mismatch
-between the two was found: this file's version was guessing field
-names from the plan doc rather than the live backend shape.
+Both the id-then-name-then-search lookup AND the raw JSON -> Property
+mapping are shared with property_service.py (resolve_raw_project,
+raw_to_property) rather than duplicated here - a previous version of
+this file had its own independent copy of both, which is how a real
+mismatch between the two went unnoticed for a while.
 """
 from typing import Optional
 
@@ -47,12 +45,14 @@ async def resolve_campaign_property(client, phone: str, project_code: Optional[s
         logger.warning("No project_code available for phone %s (not in request or context store)", phone)
         return _not_found()
 
-    raw = await client.fetch_project(code)
-    if raw is None:
-        raw = await client.fetch_project_by_name(code)
+    # `code` is very likely a projectCode/projectName-style value, not
+    # the backend's internal `id` - passed as both code and name here
+    # so resolve_raw_project tries it as an id first, then as a name,
+    # then falls back to a fuzzy search - see that function's docstring.
+    raw = await property_service.resolve_raw_project(client, code, code)
 
     if raw is None:
-        logger.warning("Could not resolve project_code=%s for phone %s via id or name lookup", code, phone)
+        logger.warning("Could not resolve project_code=%s for phone %s via id, name, or search", code, phone)
         return _not_found()
 
     prop = property_service.raw_to_property(raw, fallback_code=code)

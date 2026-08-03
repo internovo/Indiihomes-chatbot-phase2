@@ -1,5 +1,6 @@
 """Tests for property resolution - project_code path preferred, falls
-back to project_name lookup, and formatting into the Property model."""
+back to project_name lookup, then a fuzzy search, and formatting into
+the Property model."""
 import pytest
 
 from models.lead import Lead
@@ -11,15 +12,19 @@ class FakeIndihomesClient:
     """Stand-in for integrations.indihomes_client.IndihomesClient so
     these tests don't touch HTTP at all."""
 
-    def __init__(self, by_code=None, by_name=None):
+    def __init__(self, by_code=None, by_name=None, by_search=None):
         self._by_code = by_code or {}
         self._by_name = by_name or {}
+        self._by_search = by_search or {}  # {search_text: [project_dict, ...]}
 
     async def fetch_project(self, project_code):
         return self._by_code.get(project_code)
 
     async def fetch_project_by_name(self, project_name):
         return self._by_name.get(project_name)
+
+    async def fetch_filtered_projects(self, filters):
+        return self._by_search.get(filters.get("searchText"), [])
 
 
 @pytest.mark.asyncio
@@ -43,6 +48,33 @@ async def test_resolve_property_falls_back_to_name():
     prop = await property_service.resolve_property(client, lead)
     assert prop is not None
     assert prop.project_code == "ETH-ORO-01"
+
+
+@pytest.mark.asyncio
+async def test_resolve_property_falls_back_to_fuzzy_search_when_exact_name_has_a_data_typo():
+    """The actual 3 Aug 2026 finding: a real, live project's stored
+    displayName had a data-entry typo (double space + trailing space -
+    "Ariha  Opulence " vs the CRM lead's clean "Ariha Opulence"), which
+    an exact-match fetch_project_by_name will never tolerate, but the
+    website's own search (searchText) does. This is the third fallback
+    tier that exists specifically for that class of problem."""
+    client = FakeIndihomesClient(
+        by_search={
+            "Ariha Opulence": [{
+                "id": "Zi8e9PXdVluD",
+                "projectName": "INV_GW_551",
+                "displayName": "Ariha  Opulence ",  # the real, messy stored value
+                "location": {"label": "Goregaon West", "value": "goregaon west"},
+            }],
+        },
+    )
+    lead = Lead(_id="1", phone="919876543210", lead_source="Housing.com", projectName="Ariha Opulence")
+
+    prop = await property_service.resolve_property(client, lead)
+
+    assert prop is not None
+    assert prop.project_code == "INV_GW_551"
+    assert prop.location == "Goregaon West"
 
 
 @pytest.mark.asyncio
