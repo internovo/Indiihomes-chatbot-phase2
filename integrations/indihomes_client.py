@@ -27,12 +27,25 @@ class IndihomesClient:
     async def get_new_leads(self, after_date: str) -> list[dict]:
         """`afterDate` is required by the backend - calling this
         without it returns a 400. Callers should get the value from
-        utils.checkpoint.get_after_date(), not construct it themselves."""
+        utils.checkpoint.get_after_date(), not construct it themselves.
+
+        Real response shape (confirmed 3 Aug 2026 via a raw dump,
+        after this had been silently returning [] for the entire
+        project's life): {"success": true, "data": [...], "count": N}.
+        Previously looked for a "leads" key, which never existed -
+        every real lead (294 of them, at the time this was found) was
+        being silently discarded despite every request returning a
+        clean 200 OK. This is exactly the kind of failure that looks
+        completely healthy in logs while doing nothing - no exception,
+        no error status, just an empty result every time.
+        """
         async with await self._client() as client:
             resp = await client.get("/get-new-leads", params={"afterDate": after_date})
             resp.raise_for_status()
             data = resp.json()
-            return data.get("leads", data if isinstance(data, list) else [])
+            if isinstance(data, dict) and data.get("success") is False:
+                logger.warning("get-new-leads responded success=false: %s", data)
+            return data.get("data", data if isinstance(data, list) else [])
 
     @with_retry(attempts=3)
     async def fetch_project_by_name(self, project_name: str) -> dict | None:

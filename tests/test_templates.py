@@ -10,13 +10,18 @@ from utils.constants import CampaignStatus
 
 
 def test_build_template_payload_shape():
+    """Parameter "name" fields must be "1"/"2" (positional), matching
+    the approved template's {{1}}/{{2}} placeholders - confirmed
+    against the real WATI API on 3 Aug 2026 (descriptive labels like
+    "name"/"project_name" produced a generic "blank text" error on
+    every send, since nothing matched the numbered placeholders)."""
     lead = Lead(_id="1", phone="919876543210", lead_source="Housing.com", name="Priya")
     prop = Property(project_code="ETH-ORO-01", project_name="Ethics Orovia")
     payload = template_service.build_template_payload(lead, prop)
     assert payload["phone"] == "919876543210"
     assert payload["template_name"]
     names = {p["name"] for p in payload["parameters"]}
-    assert names == {"name", "project_name"}
+    assert names == {"1", "2"}
 
 
 class FakeIndihomesClient:
@@ -132,7 +137,9 @@ async def test_process_generic_lead_sends_generic_template_no_property_lookup():
 
     assert record.status == CampaignStatus.TEMPLATE_SENT
     assert wati.sent[1] == "campaign_generic_intro"
-    assert wati.sent[2] == [{"name": "name", "value": "Priya"}]
+    # "1" (positional) matching the approved template's {{1}} - see
+    # test_build_template_payload_shape's docstring for why.
+    assert wati.sent[2] == [{"name": "1", "value": "Priya"}]
     assert indihomes.updated_with[0] == "1"
 
 

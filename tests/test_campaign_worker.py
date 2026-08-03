@@ -12,9 +12,7 @@ Also covers:
   Meta Ads/anything-without-project-data leads get the generic
   template, but share the exact same retry queue/backoff as Property
   Campaign leads (retry_worker is parameterized by which processor to
-  retry with, rather than hardcoding one). DIRECT and WhatsApp Bot are
-  both explicitly ignored regardless of project data - see
-  test_run_cycle_ignores_direct_and_whatsapp_bot_leads.
+  retry with, rather than hardcoding one)
 
 Note: campaign_service.process_lead's own "no project data" advisor-notify
 safety net (CampaignStatus.ADVISOR_NOTIFIED) is tested directly in
@@ -207,7 +205,10 @@ async def test_run_cycle_routes_no_project_data_lead_to_generic_regardless_of_so
 async def test_run_cycle_sends_generic_template_for_meta_ads_leads(patch_clients):
     """Generic Interest leads - Meta Ads creatives with no project
     data - get the generic "thanks for your interest" template, never
-    touching property_service/campaign_context."""
+    touching property_service/campaign_context. Parameter "name" is
+    "1" (positional), matching the approved template's {{1}}
+    placeholder - see tests/test_templates.py's
+    test_build_template_payload_shape docstring for why."""
     leads = [
         {"_id": "1", "phone": "9876543210", "name": "Priya",
          "lead_source": "Ethics Orovia EOI Malad W v2 2907",
@@ -223,7 +224,7 @@ async def test_run_cycle_sends_generic_template_for_meta_ads_leads(patch_clients
     phone, template_name, parameters = wati.sent_templates[0]
     assert phone == "919876543210"
     assert template_name == "campaign_generic_intro"
-    assert parameters == [{"name": "name", "value": "Priya"}]
+    assert parameters == [{"name": "1", "value": "Priya"}]
     assert len(indihomes.updated_leads) == 1
     assert indihomes.updated_leads[0][1] == {"status": "template_sent"}
 
