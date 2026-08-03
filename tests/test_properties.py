@@ -1,6 +1,6 @@
 """Tests for property resolution - project_code path preferred, falls
-back to project_name lookup, then a fuzzy search, and formatting into
-the Property model."""
+back to project_name lookup, then a verified fuzzy search, and
+formatting into the Property model."""
 import pytest
 
 from models.lead import Lead
@@ -52,20 +52,37 @@ async def test_resolve_property_falls_back_to_name():
 
 @pytest.mark.asyncio
 async def test_resolve_property_falls_back_to_fuzzy_search_when_exact_name_has_a_data_typo():
-    """The actual 3 Aug 2026 finding: a real, live project's stored
-    displayName had a data-entry typo (double space + trailing space -
-    "Ariha  Opulence " vs the CRM lead's clean "Ariha Opulence"), which
-    an exact-match fetch_project_by_name will never tolerate, but the
-    website's own search (searchText) does. This is the third fallback
-    tier that exists specifically for that class of problem."""
+    """The actual 3 Aug 2026 finding, in two parts:
+
+    1. A real, live project's stored displayName had a data-entry typo
+       (double space + trailing space - "Ariha  Opulence " vs the CRM
+       lead's clean "Ariha Opulence"), which an exact-match
+       fetch_project_by_name will never tolerate.
+    2. The search endpoint does literal substring matching, not fuzzy
+       matching - searching the full phrase "Ariha Opulence" (single
+       space) returns NOTHING against the stored double-spaced value,
+       so the code searches just the first word ("Ariha") instead.
+       That's ambiguous by itself (a second real project, "Ariha
+       Vincere", shares the same first word) - this test includes that
+       decoy specifically to prove the whitespace-normalized full-name
+       comparison correctly rejects it and picks the right one, not
+       just whichever result happens to come first."""
     client = FakeIndihomesClient(
         by_search={
-            "Ariha Opulence": [{
-                "id": "Zi8e9PXdVluD",
-                "projectName": "INV_GW_551",
-                "displayName": "Ariha  Opulence ",  # the real, messy stored value
-                "location": {"label": "Goregaon West", "value": "goregaon west"},
-            }],
+            "Ariha": [
+                {
+                    "id": "OTHER123",
+                    "projectName": "INV_GW_550",
+                    "displayName": "Ariha Vincere",  # decoy - same first word, must NOT be picked
+                    "location": {"label": "Malad West", "value": "malad west"},
+                },
+                {
+                    "id": "Zi8e9PXdVluD",
+                    "projectName": "INV_GW_551",
+                    "displayName": "Ariha  Opulence ",  # the real, messy stored value - correct match
+                    "location": {"label": "Goregaon West", "value": "goregaon west"},
+                },
+            ],
         },
     )
     lead = Lead(_id="1", phone="919876543210", lead_source="Housing.com", projectName="Ariha Opulence")

@@ -8,9 +8,10 @@ Covers two related fixes:
   would silently return "not found" for every real lead.
 - 3 Aug 2026: even the name fallback can miss a real project if its
   stored displayName has a data-entry typo (e.g. extra whitespace) -
-  resolve_raw_project's third tier (a fuzzy searchText fallback)
-  covers that case too. Both fixes are shared with property_service.py
-  via resolve_raw_project/raw_to_property, not duplicated here.
+  resolve_raw_project's third tier (a verified, first-word searchText
+  fallback) covers that case too. Both fixes are shared with
+  property_service.py via resolve_raw_project/raw_to_property, not
+  duplicated here.
 """
 import pytest
 
@@ -23,7 +24,8 @@ class FakeIndihomesClient:
     internal `id`, e.g. "BII0kGNfkFaU"); by_name simulates
     /fetchProjectByName (keyed by projectName/displayName, e.g.
     "INV_GW_552"); by_search simulates /fetchPaginatedFilteredProjectList's
-    searchText fallback (keyed by search string, returns a list)."""
+    searchText fallback (keyed by search string - note this is now the
+    FIRST WORD of the sought name, not the full name - returns a list)."""
 
     def __init__(self, by_id=None, by_name=None, by_search=None):
         self._by_id = by_id or {}
@@ -80,11 +82,19 @@ async def test_falls_back_to_name_lookup_when_code_is_not_a_real_id():
 async def test_falls_back_to_fuzzy_search_when_exact_name_has_a_data_typo():
     """Mirrors the real "Ariha Opulence" finding: the exact-match name
     lookup misses because the backend's stored displayName has a typo
-    (extra whitespace), but the search endpoint tolerates it."""
-    client = FakeIndihomesClient(by_search={"Ariha Opulence": [RAW_PROJECT]})
+    (extra whitespace) the search endpoint's literal substring match
+    also can't bridge on the full phrase - so this searches the first
+    word ("Ariha") and verifies against a decoy ("Ariha Vincere",
+    sharing that first word) to confirm the right one gets picked."""
+    client = FakeIndihomesClient(by_search={
+        "Ariha": [
+            {"id": "OTHER123", "projectName": "INV_GW_550", "displayName": "Ariha Vincere"},
+            {"id": "Zi8e9PXdVluD", "projectName": "INV_GW_551", "displayName": "Ariha  Opulence "},
+        ],
+    })
     result = await campaign_property_service.resolve_campaign_property(client, "919876543210", "Ariha Opulence")
     assert result.found == "yes"
-    assert result.project_name == "38 Avenue"
+    assert result.code == "INV_GW_551"
 
 
 @pytest.mark.asyncio

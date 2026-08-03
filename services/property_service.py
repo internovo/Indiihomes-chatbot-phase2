@@ -18,8 +18,24 @@ lookup, and centralizing prevents them drifting again. The third tier
 (searchText) exists because a real, live project ("Ariha Opulence")
 had a data-entry typo in its stored displayName ("Ariha  Opulence " -
 double space, trailing space) that an exact-match name lookup can
-never tolerate, but the search endpoint does.
+never tolerate.
+
+That third tier itself needed a correction the same day: the search
+endpoint turned out to do plain substring matching against the raw
+stored name, not fuzzy/tokenized matching - searching the full phrase
+"Ariha Opulence" (normal single space) returned NOTHING, because it's
+not a literal substring of the stored "Ariha  Opulence " (double
+space). Searching just the first word ("Ariha") does match - but
+there's a second real project, "Ariha Vincere", sharing that same
+first word. Blindly taking the first search result back would risk
+confidently attaching the wrong property to a lead. So the search
+tries the first word (broad net) and then verifies every candidate
+against a whitespace-normalized, case-insensitive comparison of the
+FULL name before accepting one - narrow enough to reject "Ariha
+Vincere" when looking for "Ariha Opulence", forgiving enough to accept
+"Ariha  Opulence " when looking for "Ariha Opulence".
 """
+import re
 from typing import Any, Optional
 
 from integrations.indihomes_client import IndihomesClient
@@ -99,6 +115,13 @@ def _floor_plan_url(raw: dict) -> str | None:
     return None
 
 
+def _normalize_for_match(text: str) -> str:
+    """Collapses any run of whitespace to a single space and lowercases,
+    so "Ariha  Opulence " and "Ariha Opulence" compare equal despite a
+    data-entry whitespace typo in the stored value."""
+    return re.sub(r"\s+", " ", text or "").strip().lower()
+
+
 def raw_to_property(raw: dict, fallback_code: str = "", fallback_name: str = "") -> Property:
     """Turns the backend's raw project JSON (from /fetchProject,
     /fetchProjectByName, or /fetchPaginatedFilteredProjectList) into a
@@ -130,10 +153,17 @@ async def resolve_raw_project(client: IndihomesClient, code: Optional[str], name
     1. fetch_project(code) - works if `code` happens to be the backend's
        real internal `id`.
     2. fetch_project_by_name(name) - works for an exact display-name match.
-    3. fetch_filtered_projects({"searchText": name}) - a fuzzy fallback,
-       added after a real project's stored displayName turned out to
-       have a data-entry typo (extra internal whitespace) that step 2's
-       exact match could never tolerate, but the search endpoint does.
+    3. fetch_filtered_projects({"searchText": <first word of name>}) -
+       a fuzzy fallback for data-entry typos (extra whitespace) that
+       step 2's exact match can't tolerate. Searches on just the first
+       word (the search endpoint does literal substring matching, not
+       tokenized fuzzy matching, so the full phrase can miss a
+       whitespace-inconsistent stored value) and verifies every
+       candidate against a whitespace-normalized comparison of the FULL
+       name before accepting one - broad enough to find the typo,
+       narrow enough to reject a different project sharing the same
+       first word (e.g. "Ariha Vincere" when looking for "Ariha
+       Opulence").
     """
     raw: dict | None = None
 
@@ -144,10 +174,18 @@ async def resolve_raw_project(client: IndihomesClient, code: Optional[str], name
         raw = await client.fetch_project_by_name(name)
 
     if raw is None and name:
-        results = await client.fetch_filtered_projects({"searchText": name, "limit": 1})
-        if results:
-            raw = results[0]
-            logger.info("Resolved project via searchText fallback for name=%r (exact lookups missed)", name)
+        first_word = name.split()[0] if name.split() else name
+        candidates = await client.fetch_filtered_projects({"searchText": first_word, "limit": 20})
+        target = _normalize_for_match(name)
+        for candidate in candidates:
+            display = candidate.get("displayName") or candidate.get("projectName") or ""
+            if _normalize_for_match(display) == target:
+                raw = candidate
+                logger.info(
+                    "Resolved project via searchText fallback for name=%r (matched display=%r among %d candidate(s))",
+                    name, display, len(candidates),
+                )
+                break
 
     return raw
 
@@ -155,9 +193,9 @@ async def resolve_raw_project(client: IndihomesClient, code: Optional[str], name
 async def resolve_property(client: IndihomesClient, lead: Lead) -> Property | None:
     """Prefers an explicit project_code (the reliable path the plan
     recommends every campaign eventually attach). Falls back to
-    project_name / fetchProjectByName, then a fuzzy search, for
-    campaigns that only pass a name today - or whose stored name has a
-    data-quality issue an exact match can't tolerate."""
+    project_name / fetchProjectByName, then a verified fuzzy search,
+    for campaigns that only pass a name today - or whose stored name
+    has a data-quality issue an exact match can't tolerate."""
     raw = await resolve_raw_project(client, lead.project_code, lead.project_name)
 
     if raw is None:
