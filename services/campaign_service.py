@@ -116,7 +116,10 @@ async def process_generic_lead(
         await wati_client.send_template(
             lead.phone,
             settings.wati_generic_template_name,
-            [{"name": "name", "value": lead.name or "there"}],
+            # "1" = the positional placeholder in the approved template's
+            # body ({{1}}) - see formatter.template_parameters for why
+            # this must be the position number, not a descriptive label.
+            [{"name": "1", "value": lead.name or "there"}],
         )
         record.mark_sent()
 

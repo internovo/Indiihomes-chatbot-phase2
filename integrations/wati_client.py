@@ -1,7 +1,20 @@
 """Thin async wrapper around the WATI API. Only what the campaign flow
 actually needs: sending a pre-approved template (to open the
 conversation with a lead who hasn't messaged us first) and a couple of
-light contact-management helpers that are cheap to include."""
+light contact-management helpers that are cheap to include.
+
+send_template uses the v2 endpoint - v1 was returning a generic
+{"result": false, "info": "Check your template, it cannot have typos
+or blank text"} error on every single send attempt (both approved
+templates, multiple recipients, after confirming the tenant-ID-suffixed
+endpoint and API key were both correct) as of 3 Aug 2026. WATI's own
+help docs (support.wati.io, "How to track template message delivery...")
+explicitly point to v2 as the current endpoint; v1 appears to still
+exist but not be reliably functional. Response shape differs
+(v2: {"result", "error", "templateName", "receivers"} vs v1's
+{"result", "info", "validWhatsAppNumber"}) but nothing in this codebase
+reads specific fields off the return value, so this is a safe swap.
+"""
 import httpx
 
 from config import get_settings
@@ -29,7 +42,7 @@ class WatiClient:
         """parameters is WATI's expected shape: [{"name": "name", "value": "..."}]"""
         async with await self._client() as client:
             resp = await client.post(
-                f"/api/v1/sendTemplateMessage?whatsappNumber={phone}",
+                f"/api/v2/sendTemplateMessage?whatsappNumber={phone}",
                 json={"template_name": template_name, "broadcast_name": template_name, "parameters": parameters},
             )
             resp.raise_for_status()

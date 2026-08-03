@@ -39,8 +39,19 @@ def property_to_whatsapp_card(prop: Property) -> str:
 
 
 def template_parameters(lead_name: str, prop: Property) -> list[dict]:
-    """Shape WATI expects for template variable substitution."""
+    """Shape WATI expects for template variable substitution.
+
+    "name" here must be the POSITIONAL NUMBER as a string ("1", "2",
+    ...), not a descriptive label - confirmed 3 Aug 2026 after every
+    real send attempt failed with a generic "blank text" error despite
+    correct template name, valid recipient, and correct parameter
+    count. campaign_property_intro's approved body uses {{1}} and
+    {{2}} (numbered placeholders, not named ones like {{customer_name}}),
+    and WATI's own Zapier integration docs show "name": "1" for
+    exactly this placeholder style. {{1}} = name, {{2}} = project_name,
+    in that order, matching the approved template's body text.
+    """
     return [
-        {"name": "name", "value": lead_name or "there"},
-        {"name": "project_name", "value": prop.project_name},
+        {"name": "1", "value": lead_name or "there"},
+        {"name": "2", "value": prop.project_name},
     ]
