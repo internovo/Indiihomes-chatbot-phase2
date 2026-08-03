@@ -9,7 +9,16 @@ class Lead(BaseModel):
     id: str = Field(alias="_id")
     name: Optional[str] = ""
     phone: str
-    lead_source: str = ""
+    # Real backend key is "leadSource" (confirmed via a raw response
+    # dump, 3 Aug 2026) - this field had NO alias for the project's
+    # entire life, so it silently defaulted to "" for every real lead
+    # ever parsed. That in turn meant classify_lead()'s IGNORED check
+    # (matching against "whatsapp bot"/"direct") could never actually
+    # fire in production, despite being correctly implemented - it was
+    # always comparing those markers against an empty string. Every
+    # other camelCase field on this model already had an alias; this
+    # one was simply missed.
+    lead_source: str = Field(default="", alias="leadSource")
     project_code: Optional[str] = Field(default=None, alias="projectCode")
     project_name: Optional[str] = Field(default=None, alias="projectName")
     status: Optional[str] = None

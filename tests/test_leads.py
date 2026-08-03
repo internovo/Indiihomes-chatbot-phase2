@@ -6,7 +6,16 @@ cases below are the actual scenarios found in real CRM data that day:
 Housing.com with AND without project data, DIRECT (never has project
 data, but ignored regardless per the lead-source diagram - see below),
 several differently-named Meta Ads creatives, 99 Acres, and WhatsApp
-Bot (has project data but must still be ignored)."""
+Bot (has project data but must still be ignored).
+
+IMPORTANT (3 Aug 2026): most tests below construct Lead(...) directly
+with lead_source=... as a keyword argument, which works via
+populate_by_name regardless of whether an alias is set - this is
+exactly why the missing "leadSource" alias bug went undetected by this
+whole file for so long. test_parse_leads_from_realistic_raw_dict below
+is the one that actually exercises Lead.model_validate() against the
+real backend's camelCase key, which is what would have caught it.
+"""
 from models.lead import Lead
 from services.lead_service import (
     classify_lead,
@@ -67,14 +76,41 @@ def test_classify_ignored_overrides_project_data_presence():
     assert classify_lead(direct_lead) == LeadSourceCategory.IGNORED
 
 
+def test_parse_leads_from_realistic_raw_dict_maps_leadsource_correctly():
+    """THE regression test for the 3 Aug 2026 bug: Lead had no alias
+    for lead_source at all, so the real backend's camelCase
+    "leadSource" key was never recognized and silently defaulted to
+    "" for every real lead ever parsed - which in turn meant the
+    IGNORED-category check above could never actually fire in
+    production, despite being correctly implemented. Uses the REAL key
+    name deliberately, unlike every Lead(...) constructor call above
+    (which works via populate_by_name regardless of alias and would
+    never have caught this)."""
+    raw = [{
+        "_id": "abc123",
+        "name": "Test Person",
+        "phone": "9876543210",
+        "leadSource": "WhatsApp Bot",  # the real backend's actual key
+        "projectCode": "INV_GE_901",
+        "leadDate": "2026-08-03T09:58:00.000Z",
+    }]
+    leads = parse_leads(raw)
+    assert len(leads) == 1
+    assert leads[0].lead_source == "WhatsApp Bot"
+    # And the thing that actually matters: classification now correctly
+    # ignores it, end to end from raw dict through to category.
+    assert classify_lead(leads[0]) == LeadSourceCategory.IGNORED
+
+
 def test_parse_leads_skips_malformed():
     raw = [
-        {"_id": "1", "phone": "9876543210", "lead_source": "Housing.com"},
+        {"_id": "1", "phone": "9876543210", "leadSource": "Housing.com"},
         {"_id": "2"},  # missing required `phone`
     ]
     leads = parse_leads(raw)
     assert len(leads) == 1
     assert leads[0].id == "1"
+    assert leads[0].lead_source == "Housing.com"
 
 
 def test_filter_property_campaign_leads_drops_others_and_bad_phone():
