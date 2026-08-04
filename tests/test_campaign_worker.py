@@ -44,7 +44,7 @@ import pytest
 from models.lead import Lead
 from models.campaign import CampaignRecord
 from services import campaign_service
-from utils import checkpoint
+from utils import checkpoint, sent_template_store
 from utils.constants import CampaignStatus
 from workers import campaign_worker, retry_worker
 
@@ -73,6 +73,12 @@ def temp_checkpoint(tmp_path, monkeypatch):
     monkeypatch.setattr(checkpoint, "_CHECKPOINT_PATH", str(fake_path))
     yield fake_path
 
+
+@pytest.fixture(autouse=True)
+def temp_sent_template_store(tmp_path, monkeypatch):
+    fake_path = tmp_path / "sent_templates.json"
+    monkeypatch.setattr(sent_template_store, "_SENT_TEMPLATES_PATH", str(fake_path))
+    yield fake_path
 
 @pytest.fixture(autouse=True)
 def clear_retry_queue():
@@ -381,3 +387,35 @@ async def test_retry_worker_retries_generic_interest_leads_with_the_generic_proc
     assert retry_worker.pending_count() == 0
     assert len(wati.sent_templates) == 1
     assert wati.sent_templates[0][1] == "campaign_generic_intro"
+
+@pytest.mark.asyncio
+async def test_run_cycle_does_not_resend_after_restart_when_crm_update_fails(patch_clients):
+    """Regression for the production duplicate-send path: WATI accepts
+    the template, then update-leads-by-id fails, so the CRM can keep
+    returning the same lead as unsent. A Railway restart clears the
+    in-memory _processed_lead_ids set; the durable sent-template ledger
+    must still stop a second WATI send for the same lead/template."""
+
+    class FailingUpdateIndihomesClient(FakeIndihomesClient):
+        async def update_lead(self, lead_id, payload):
+            self.updated_leads.append((lead_id, payload))
+            raise RuntimeError("404 Client Error: Not Found for update-leads-by-id")
+
+    leads = [
+        {"_id": "1", "phone": "9876543210", "name": "Priya",
+         "lead_source": "Ethics Orovia EOI Malad W v2 2907",
+         "leadDate": "2026-08-04T08:31:04.000Z"},
+    ]
+    indihomes = FailingUpdateIndihomesClient(leads=leads, project=None)
+    wati = FakeWatiClient()
+    patch_clients(indihomes=indihomes, wati=wati)
+
+    await campaign_worker.run_cycle()
+    campaign_worker._processed_lead_ids.clear()  # simulates process memory lost on restart
+    await campaign_worker.run_cycle()
+
+    assert len(wati.sent_templates) == 1
+    assert len(indihomes.updated_leads) == 2
+    assert retry_worker.pending_count() == 0
+
+

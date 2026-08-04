@@ -6,6 +6,7 @@ import pytest
 from models.lead import Lead
 from models.property import Property
 from services import campaign_service, template_service
+from utils import sent_template_store
 from utils.constants import CampaignStatus
 
 
@@ -54,6 +55,13 @@ class FakeWatiClient:
         self.sent = (phone, template_name, parameters)
         return {"result": "success"}
 
+
+
+@pytest.fixture(autouse=True)
+def temp_sent_template_store(tmp_path, monkeypatch):
+    fake_path = tmp_path / "sent_templates.json"
+    monkeypatch.setattr(sent_template_store, "_SENT_TEMPLATES_PATH", str(fake_path))
+    yield fake_path
 
 @pytest.fixture(autouse=True)
 def fake_email_client(monkeypatch):

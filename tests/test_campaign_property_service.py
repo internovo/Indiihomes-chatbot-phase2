@@ -125,3 +125,30 @@ async def test_returns_not_found_when_no_code_available_anywhere():
     client = FakeIndihomesClient()
     result = await campaign_property_service.resolve_campaign_property(client, "919876543210", None)
     assert result.found == "no"
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("incoming_project_code", ["", "   ", "@project_code", "{{project_code}}"])
+async def test_falls_back_to_campaign_context_when_project_code_is_unavailable_or_placeholder(incoming_project_code):
+    campaign_context.remember("919876543210", "INV_GW_552")
+    client = FakeIndihomesClient(by_name={"INV_GW_552": RAW_PROJECT})
+
+    result = await campaign_property_service.resolve_campaign_property(
+        client, "919876543210", incoming_project_code,
+    )
+
+    assert result.found == "yes"
+    assert result.code == "INV_GW_552"
+    assert result.project_name == "38 Avenue"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("incoming_project_code", ["@project_code", "{{project_code}}"])
+async def test_unresolved_placeholder_without_context_returns_not_found(incoming_project_code):
+    client = FakeIndihomesClient()
+
+    result = await campaign_property_service.resolve_campaign_property(
+        client, "919876543210", incoming_project_code,
+    )
+
+    assert result.found == "no"
+    assert result.project_confirmed == "no"

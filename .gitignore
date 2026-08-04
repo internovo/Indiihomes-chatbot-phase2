@@ -6,5 +6,4 @@ venv/
 *.egg-info/
 .pytest_cache/
 
-/README.md
-/DOCUMENTATION.md
+/state/

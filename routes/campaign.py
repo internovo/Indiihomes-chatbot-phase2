@@ -19,6 +19,26 @@ from services import campaign_property_service, notify_service
 
 router = APIRouter(tags=["campaign"])
 
+from services import campaign_context
+
+@router.post("/debug/context")
+async def debug_set_context():
+    campaign_context.remember(
+        "919876543210",
+        "INV_GW_552",
+    )
+    return {
+        "status": "stored"
+    }
+
+
+@router.get("/debug/context/{phone}")
+async def debug_get_context(phone: str):
+    return {
+        "phone": phone,
+        "project_code": campaign_context.get_project_code(phone)
+    }
+
 
 @router.post("/property-detail", response_model=PropertyDetailResponse)
 async def property_detail(payload: PropertyDetailRequest) -> PropertyDetailResponse:

@@ -44,6 +44,7 @@ from models.campaign import CampaignRecord
 from models.lead import Lead
 from models.notify import NotifyAdvisorRequest
 from services import campaign_context, notify_service, property_service, template_service
+from utils import sent_template_store
 from utils.constants import CampaignStatus
 from utils.logger import get_logger
 
@@ -111,11 +112,24 @@ async def process_lead(
         # the WATI flow calls back before a project_code contact
         # attribute is set on the contact.
         campaign_context.remember(lead.phone, prop.project_code)
-
+        logger.info(
+    "Remembering phone=%s project_code=%s project_name=%s",
+    lead.phone,
+    prop.project_code,
+    prop.project_name,
+)
         payload = template_service.build_template_payload(lead, prop)
-        await wati_client.send_template(payload["phone"], payload["template_name"], payload["parameters"])
-        record.mark_sent()
-        logger.info("Campaign template sent to lead %s for project %s", lead.id, prop.project_name)
+        if sent_template_store.has_sent(lead.id, payload["template_name"]):
+            record.mark_sent()
+            logger.warning(
+                "Skipping duplicate campaign template send for lead %s template %s - already recorded as sent",
+                lead.id, payload["template_name"],
+            )
+        else:
+            await wati_client.send_template(payload["phone"], payload["template_name"], payload["parameters"])
+            sent_template_store.mark_sent(lead.id, payload["template_name"])
+            record.mark_sent()
+            logger.info("Campaign template sent to lead %s for project %s", lead.id, prop.project_name)
 
     except Exception as exc:  # noqa: BLE001 - a failing lead must not crash the batch
         logger.error("Lead %s failed: %s", lead.id, exc)
@@ -144,16 +158,24 @@ async def process_generic_lead(
 
     try:
         settings = get_settings()
-        await wati_client.send_template(
-            lead.phone,
-            settings.wati_generic_template_name,
+        template_name = settings.wati_generic_template_name
+        parameters = [
             # "1" = the positional placeholder in the approved template's
             # body ({{1}}) - see formatter.template_parameters for why
             # this must be the position number, not a descriptive label.
-            [{"name": "1", "value": lead.name or "there"}],
-        )
-        record.mark_sent()
-        logger.info("Generic-interest template sent to lead %s (source=%r)", lead.id, lead.lead_source)
+            {"name": "1", "value": lead.name or "there"},
+        ]
+        if sent_template_store.has_sent(lead.id, template_name):
+            record.mark_sent()
+            logger.warning(
+                "Skipping duplicate campaign template send for lead %s template %s - already recorded as sent",
+                lead.id, template_name,
+            )
+        else:
+            await wati_client.send_template(lead.phone, template_name, parameters)
+            sent_template_store.mark_sent(lead.id, template_name)
+            record.mark_sent()
+            logger.info("Generic-interest template sent to lead %s (source=%r)", lead.id, lead.lead_source)
 
     except Exception as exc:  # noqa: BLE001 - a failing lead must not crash the batch
         logger.error("Generic lead %s failed: %s", lead.id, exc)
@@ -180,3 +202,5 @@ async def process_generic_batch(
     wati_client: WatiClient,
 ) -> list[CampaignRecord]:
     return [await process_generic_lead(lead, indihomes_client, wati_client) for lead in leads]
+
+

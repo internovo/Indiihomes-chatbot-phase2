@@ -22,6 +22,7 @@ raw_to_property) rather than duplicated here - a previous version of
 this file had its own independent copy of both, which is how a real
 mismatch between the two went unnoticed for a while.
 """
+import re
 from typing import Optional
 
 from models.property_detail import PropertyDetailResponse
@@ -32,14 +33,36 @@ from utils.logger import get_logger
 
 logger = get_logger("campaign_property_service")
 
+_PLACEHOLDER_RE = re.compile(r"^\s*(?:@[A-Za-z_][A-Za-z0-9_]*|\{\{\s*[A-Za-z_][A-Za-z0-9_]*\s*\}\})\s*$")
+
 
 def _not_found() -> PropertyDetailResponse:
     return PropertyDetailResponse(found="no", project_confirmed="no")
 
 
+def _usable_project_code(project_code: Optional[str]) -> str | None:
+    if project_code is None:
+        return None
+    code = project_code.strip()
+    if not code:
+        return None
+    if _PLACEHOLDER_RE.match(code):
+        return None
+    return code
+
+
 async def resolve_campaign_property(client, phone: str, project_code: Optional[str]) -> PropertyDetailResponse:
     phone = normalize_phone(phone)
-    code = project_code or campaign_context.get_project_code(phone)
+    request_code = _usable_project_code(project_code)
+    context_code = campaign_context.get_project_code(phone)
+    fallback_used = request_code is None and bool(context_code)
+    code = request_code or context_code
+
+    logger.info(
+        "property_detail_project_code_resolution incoming_project_code=%r fallback_used=%s "
+        "final_project_code=%r phone=%s",
+        project_code, fallback_used, code, phone,
+    )
 
     if not code:
         logger.warning("No project_code available for phone %s (not in request or context store)", phone)
@@ -71,3 +94,5 @@ async def resolve_campaign_property(client, phone: str, project_code: Optional[s
         floor_plan_url=prop.floor_plan_url or "",
         image_url=prop.image_url or "",
     )
+
+
