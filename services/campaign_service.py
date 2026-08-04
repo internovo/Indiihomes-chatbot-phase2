@@ -23,6 +23,19 @@ workers/retry_worker.py can retry either one identically - it takes
 the processor function as a parameter rather than hardcoding
 process_lead, specifically so Generic Interest leads get the exact
 same retry/backoff treatment as Property Campaign ones.
+
+CRITICAL (fixed 4 Aug 2026): the CRM status update (update_lead) used
+to be inside the same try/except as everything else, including the
+WATI send. That meant if update_lead failed AFTER a successful send
+(confirmed real: every update-leads-by-id call was 404ing, apparently
+never actually verified end-to-end before that day), the WHOLE
+function was treated as failed and queued for retry - and a retry
+re-runs the entire function, including RE-SENDING the WATI template to
+a real customer. Once a send has genuinely succeeded, nothing after it
+should ever be able to trigger a resend. update_lead now has its own
+inner try/except: if it fails, that's logged loudly (it's still a real
+problem worth knowing about - the CRM won't show this lead as
+contacted), but the record stays TEMPLATE_SENT and is never retried.
 """
 from integrations.indihomes_client import IndihomesClient
 from integrations.wati_client import WatiClient
@@ -35,6 +48,22 @@ from utils.constants import CampaignStatus
 from utils.logger import get_logger
 
 logger = get_logger("campaign_service")
+
+
+async def _update_crm_status_after_send(indihomes_client: IndihomesClient, lead: Lead) -> None:
+    """Best-effort CRM status update AFTER a WATI send has already
+    succeeded. Deliberately swallows its own exceptions (logging
+    loudly instead) - see module docstring for why a failure here must
+    never be allowed to trigger a retry, which would re-send the
+    message that already went out."""
+    try:
+        await indihomes_client.update_lead(lead.id, {"status": CampaignStatus.TEMPLATE_SENT})
+    except Exception as exc:  # noqa: BLE001 - see docstring; must never propagate
+        logger.error(
+            "Template already sent to lead %s, but the CRM status update failed (NOT retrying - "
+            "a retry would re-send the template to this real customer): %s",
+            lead.id, exc,
+        )
 
 
 async def process_lead(
@@ -86,14 +115,16 @@ async def process_lead(
         payload = template_service.build_template_payload(lead, prop)
         await wati_client.send_template(payload["phone"], payload["template_name"], payload["parameters"])
         record.mark_sent()
-
-        await indihomes_client.update_lead(lead.id, {"status": CampaignStatus.TEMPLATE_SENT})
         logger.info("Campaign template sent to lead %s for project %s", lead.id, prop.project_name)
 
     except Exception as exc:  # noqa: BLE001 - a failing lead must not crash the batch
         logger.error("Lead %s failed: %s", lead.id, exc)
         record.mark_failed(str(exc), backoff_seconds=5 * 60)
+        return record
 
+    # Past this point the message has DEFINITELY gone out - nothing
+    # below can change record.status back to something retryable.
+    await _update_crm_status_after_send(indihomes_client, lead)
     return record
 
 
@@ -122,14 +153,16 @@ async def process_generic_lead(
             [{"name": "1", "value": lead.name or "there"}],
         )
         record.mark_sent()
-
-        await indihomes_client.update_lead(lead.id, {"status": CampaignStatus.TEMPLATE_SENT})
         logger.info("Generic-interest template sent to lead %s (source=%r)", lead.id, lead.lead_source)
 
     except Exception as exc:  # noqa: BLE001 - a failing lead must not crash the batch
         logger.error("Generic lead %s failed: %s", lead.id, exc)
         record.mark_failed(str(exc), backoff_seconds=5 * 60)
+        return record
 
+    # Past this point the message has DEFINITELY gone out - nothing
+    # below can change record.status back to something retryable.
+    await _update_crm_status_after_send(indihomes_client, lead)
     return record
 
 

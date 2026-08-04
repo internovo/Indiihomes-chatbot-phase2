@@ -1,13 +1,14 @@
 """Core background worker. Every POLL_INTERVAL_SECONDS:
   1. Load checkpoint (afterDate)
   2. GET /get-new-leads?afterDate=<checkpoint>
-  3. Classify leads into Property Campaign / Generic Interest / Ignored
-  4. Process each bucket (Property Campaign: property lookup + specific
+  3. Skip anything already processed this session (see _processed_lead_ids)
+  4. Classify leads into Property Campaign / Generic Interest / Ignored
+  5. Process each bucket (Property Campaign: property lookup + specific
      template; Generic Interest: name-only "thanks for your interest"
      template - see services/campaign_service.py for both)
-  5. Track the newest lead timestamp seen (excluding anything
+  6. Track the newest lead timestamp seen (excluding anything
      suspiciously far in the future - see _newest_timestamp)
-  6. Save checkpoint - but ONLY after a successful cycle, so a bad
+  7. Save checkpoint - but ONLY after a successful cycle, so a bad
      cycle can't silently skip leads.
 
 Failed leads are handed to retry_worker's in-memory queue instead of
@@ -42,6 +43,23 @@ logger = get_logger("campaign_worker")
 # see _newest_timestamp's docstring for why this exists.
 _MAX_FUTURE_SKEW = timedelta(minutes=10)
 
+# Lead IDs already fetched-and-processed THIS RUNNING SESSION, regardless
+# of outcome (sent, retrying, or advisor-notified). CRITICAL safety net,
+# confirmed necessary from a real incident on 4 Aug 2026: a lead whose
+# own leadDate is corrupted/future (or whose CRM status update keeps
+# failing, so the CRM's own status field never reflects that it was
+# contacted) will satisfy "afterDate < leadDate" on EVERY cycle forever,
+# with nothing else in this codebase stopping it from being reprocessed
+# - and re-MESSAGED - every 45 seconds indefinitely. This set is checked
+# before any processing happens, independent of both the checkpoint and
+# whatever the CRM says. Same in-memory tradeoff already accepted for
+# campaign_context/retry_worker (not persisted, resets on restart) -
+# acceptable since a restart naturally re-syncs via a fresh checkpoint
+# window; unbounded growth over a very long-running process without
+# redeploys is a known, currently-accepted tradeoff, not yet a problem
+# at this service's lead volume.
+_processed_lead_ids: set[str] = set()
+
 
 def _parse_ts(ts: str) -> datetime | None:
     try:
@@ -64,12 +82,9 @@ def _newest_timestamp(leads) -> str | None:
     a real CRM-entered date) advanced the checkpoint into the future.
     Every subsequent get-new-leads call then returned empty, since
     nothing can be "after" a future date yet - silently freezing the
-    entire pipeline for hours. Real leads in that window (confirmed:
-    at least 3, including 2 Generic Interest) were never even fetched,
-    let alone processed or retried. A single bad timestamp must never
-    be able to do that again. Note: this only affects checkpoint
-    advancement - the lead itself is still processed normally either
-    way, just doesn't get to decide how far the checkpoint moves."""
+    entire pipeline for hours. This alone does NOT stop that same lead
+    from being repeatedly reprocessed once the pipeline is unstuck -
+    see _processed_lead_ids above for that half of the fix."""
     now = datetime.now(timezone.utc)
     valid_timestamps = []
     for lead in leads:
@@ -120,30 +135,43 @@ async def run_cycle() -> None:
     if not leads:
         return
 
-    # Advance the checkpoint against the FULL fetched batch (not just
-    # the classified subsets) - Ignored-category leads still count as
-    # "seen" and must not be re-fetched next cycle.
+    # Advance the checkpoint against the FULL fetched batch, BEFORE
+    # filtering out already-processed ones below - a lead we've already
+    # handled must still count as "seen" for checkpoint purposes.
     newest_seen = _newest_timestamp(leads)
 
-    property_leads = lead_service.filter_property_campaign_leads(leads)
-    generic_leads = lead_service.filter_generic_interest_leads(leads)
-    logger.info(
-        "%d leads since %s: %d Property Campaign, %d Generic Interest",
-        len(leads), after_date, len(property_leads), len(generic_leads),
-    )
+    already_processed = [lead for lead in leads if lead.id in _processed_lead_ids]
+    if already_processed:
+        logger.warning(
+            "Skipping %d lead(s) already processed this session (would otherwise be reprocessed - "
+            "and re-messaged - every cycle; see _processed_lead_ids docstring): %s",
+            len(already_processed), [lead.id for lead in already_processed],
+        )
+    leads = [lead for lead in leads if lead.id not in _processed_lead_ids]
 
-    if property_leads:
-        records = await campaign_service.process_batch(property_leads, indihomes_client, wati_client)
-        sent, queued, notified = _summarize_and_queue(records, property_leads, campaign_service.process_lead)
+    if leads:
+        property_leads = lead_service.filter_property_campaign_leads(leads)
+        generic_leads = lead_service.filter_generic_interest_leads(leads)
         logger.info(
-            "Property Campaign cycle: %d sent, %d queued for retry, %d advisor-notified (no project data)",
-            sent, queued, notified,
+            "%d leads since %s: %d Property Campaign, %d Generic Interest",
+            len(leads), after_date, len(property_leads), len(generic_leads),
         )
 
-    if generic_leads:
-        generic_records = await campaign_service.process_generic_batch(generic_leads, indihomes_client, wati_client)
-        sent, queued, _ = _summarize_and_queue(generic_records, generic_leads, campaign_service.process_generic_lead)
-        logger.info("Generic Interest cycle: %d sent, %d queued for retry", sent, queued)
+        for lead in leads:
+            _processed_lead_ids.add(lead.id)
+
+        if property_leads:
+            records = await campaign_service.process_batch(property_leads, indihomes_client, wati_client)
+            sent, queued, notified = _summarize_and_queue(records, property_leads, campaign_service.process_lead)
+            logger.info(
+                "Property Campaign cycle: %d sent, %d queued for retry, %d advisor-notified (no project data)",
+                sent, queued, notified,
+            )
+
+        if generic_leads:
+            generic_records = await campaign_service.process_generic_batch(generic_leads, indihomes_client, wati_client)
+            sent, queued, _ = _summarize_and_queue(generic_records, generic_leads, campaign_service.process_generic_lead)
+            logger.info("Generic Interest cycle: %d sent, %d queued for retry", sent, queued)
 
     if newest_seen:
         checkpoint.save_checkpoint(newest_seen)

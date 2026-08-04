@@ -13,10 +13,13 @@ Also covers:
   template, but share the exact same retry queue/backoff as Property
   Campaign leads (retry_worker is parameterized by which processor to
   retry with, rather than hardcoding one)
-- the 4 Aug 2026 fix: a lead with a corrupted/future-dated timestamp
-  must never be able to advance the checkpoint past the present and
-  silently freeze the whole pipeline (see
-  test_run_cycle_ignores_far_future_timestamp_for_checkpoint_purposes)
+- the 4 Aug 2026 fixes: a lead with a corrupted/future-dated timestamp
+  must never be able to (a) advance the checkpoint past the present and
+  silently freeze the whole pipeline, or (b) be reprocessed - and
+  re-MESSAGED - every single cycle forever, since its own timestamp
+  will satisfy "afterDate" indefinitely. (a) is
+  test_run_cycle_ignores_far_future_timestamp_for_checkpoint_purposes;
+  (b) is test_run_cycle_never_reprocesses_a_lead_id_twice_in_one_session.
 
 Note: campaign_service.process_lead's own "no project data" advisor-notify
 safety net (CampaignStatus.ADVISOR_NOTIFIED) is tested directly in
@@ -76,6 +79,13 @@ def clear_retry_queue():
     retry_worker._queue.clear()
     yield
     retry_worker._queue.clear()
+
+
+@pytest.fixture(autouse=True)
+def clear_processed_lead_ids():
+    campaign_worker._processed_lead_ids.clear()
+    yield
+    campaign_worker._processed_lead_ids.clear()
 
 
 class FakeIndihomesClient:
@@ -299,6 +309,36 @@ async def test_run_cycle_ignores_far_future_timestamp_for_checkpoint_purposes(pa
     # only affects checkpoint advancement, not whether the lead itself
     # gets its template.
     assert len(wati.sent_templates) == 2
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_never_reprocesses_a_lead_id_twice_in_one_session(patch_clients):
+    """The actual 4 Aug 2026 incident: a real lead (Veronica) whose
+    leadDate was corrupted/future kept satisfying "afterDate" on every
+    single cycle, since the checkpoint could never advance past her -
+    so campaign_worker kept refetching AND REPROCESSING her, sending
+    the real WATI template again every ~45 seconds, confirmed via
+    production logs (2 sends visible within the first 90 seconds
+    alone). The checkpoint-future-skew fix alone does not stop this -
+    it only stops the checkpoint from moving into the future, it
+    doesn't stop the same lead ID from being handed to process_*_lead
+    again on the next cycle. This test simulates that exact scenario:
+    the SAME lead is returned by get_new_leads on two consecutive
+    run_cycle() calls (as it would be, in production, given its
+    corrupted timestamp always satisfies afterDate) - the lead must
+    only actually be processed (and messaged) once."""
+    leads = [
+        {"_id": "1249966110511632", "phone": "9820901995", "name": "Veronica",
+         "lead_source": "Ethics Orovia EOI Malad W v2 2907", "leadDate": "2026-08-04T08:31:04.925Z"},
+    ]
+    indihomes = FakeIndihomesClient(leads=leads, project=None)
+    wati = FakeWatiClient()
+    patch_clients(indihomes=indihomes, wati=wati)
+
+    await campaign_worker.run_cycle()
+    await campaign_worker.run_cycle()  # same lead returned again, as it would be in production
+
+    assert len(wati.sent_templates) == 1
 
 
 @pytest.mark.asyncio
