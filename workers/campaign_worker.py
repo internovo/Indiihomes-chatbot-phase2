@@ -5,7 +5,8 @@
   4. Process each bucket (Property Campaign: property lookup + specific
      template; Generic Interest: name-only "thanks for your interest"
      template - see services/campaign_service.py for both)
-  5. Track the newest lead timestamp seen
+  5. Track the newest lead timestamp seen (excluding anything
+     suspiciously far in the future - see _newest_timestamp)
   6. Save checkpoint - but ONLY after a successful cycle, so a bad
      cycle can't silently skip leads.
 
@@ -24,6 +25,8 @@ CRM data itself has nothing to search on. This should be rare now that
 EOI/Meta Ads leads (which never have project data) are classified as
 Generic Interest instead and never reach process_lead at all.
 """
+from datetime import datetime, timedelta, timezone
+
 from integrations.indihomes_client import get_indihomes_client
 from integrations.wati_client import get_wati_client
 from services import campaign_service, lead_service
@@ -34,13 +37,57 @@ from workers.retry_worker import queue_for_retry
 
 logger = get_logger("campaign_worker")
 
+# How far ahead of the current real time a lead's timestamp is allowed
+# to be before it's treated as corrupted/bad data rather than genuine -
+# see _newest_timestamp's docstring for why this exists.
+_MAX_FUTURE_SKEW = timedelta(minutes=10)
+
+
+def _parse_ts(ts: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
 
 def _newest_timestamp(leads) -> str | None:
-    """Picks the max lead.timestamp across a batch. Leads without a
-    usable timestamp are ignored rather than treated as the newest -
-    a missing timestamp must never accidentally rewind the checkpoint."""
-    timestamps = [lead.timestamp for lead in leads if lead.timestamp]
-    return max(timestamps) if timestamps else None
+    """Picks the max lead.timestamp across a batch, for checkpoint
+    advancement. Leads without a usable timestamp are ignored rather
+    than treated as the newest - a missing timestamp must never
+    accidentally rewind the checkpoint.
+
+    Also ignores (for checkpoint purposes only) any timestamp more
+    than _MAX_FUTURE_SKEW ahead of the current real time. Confirmed
+    4 Aug 2026: a single lead with a corrupted/mistimed timestamp
+    (non-zero sub-second precision, nearly 4 hours in the future -
+    looking like a bad "current time" capture somewhere upstream, not
+    a real CRM-entered date) advanced the checkpoint into the future.
+    Every subsequent get-new-leads call then returned empty, since
+    nothing can be "after" a future date yet - silently freezing the
+    entire pipeline for hours. Real leads in that window (confirmed:
+    at least 3, including 2 Generic Interest) were never even fetched,
+    let alone processed or retried. A single bad timestamp must never
+    be able to do that again. Note: this only affects checkpoint
+    advancement - the lead itself is still processed normally either
+    way, just doesn't get to decide how far the checkpoint moves."""
+    now = datetime.now(timezone.utc)
+    valid_timestamps = []
+    for lead in leads:
+        if not lead.timestamp:
+            continue
+        parsed = _parse_ts(lead.timestamp)
+        if parsed is None:
+            continue
+        if parsed - now > _MAX_FUTURE_SKEW:
+            logger.warning(
+                "Lead %s has a timestamp (%s) more than %s in the future (current time %s) - "
+                "ignoring it for checkpoint purposes (likely corrupted/mistimed data, not a real "
+                "future lead). The lead itself is still processed normally.",
+                lead.id, lead.timestamp, _MAX_FUTURE_SKEW, now.isoformat(),
+            )
+            continue
+        valid_timestamps.append(lead.timestamp)
+    return max(valid_timestamps) if valid_timestamps else None
 
 
 def _summarize_and_queue(records, leads, processor, indihomes_client=None, wati_client=None):

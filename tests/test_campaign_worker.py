@@ -13,6 +13,10 @@ Also covers:
   template, but share the exact same retry queue/backoff as Property
   Campaign leads (retry_worker is parameterized by which processor to
   retry with, rather than hardcoding one)
+- the 4 Aug 2026 fix: a lead with a corrupted/future-dated timestamp
+  must never be able to advance the checkpoint past the present and
+  silently freeze the whole pipeline (see
+  test_run_cycle_ignores_far_future_timestamp_for_checkpoint_purposes)
 
 Note: campaign_service.process_lead's own "no project data" advisor-notify
 safety net (CampaignStatus.ADVISOR_NOTIFIED) is tested directly in
@@ -30,6 +34,8 @@ services.notify_service.get_email_client to a fake - otherwise
 running this test file would attempt a real Brevo API call using
 whatever's in .env.
 """
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from models.lead import Lead
@@ -254,6 +260,45 @@ async def test_run_cycle_ignores_direct_and_whatsapp_bot_leads(patch_clients):
     assert len(indihomes.updated_leads) == 0
     # Still classified as "seen" for checkpoint purposes even though ignored.
     assert checkpoint.get_after_date() == "2026-07-31T13:01:00.000Z"
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_ignores_far_future_timestamp_for_checkpoint_purposes(patch_clients):
+    """The actual 4 Aug 2026 finding: a lead with a corrupted/mistimed
+    timestamp (confirmed real - nearly 4 hours in the future, with
+    non-zero sub-second precision unlike every genuine CRM-entered
+    date) advanced the checkpoint past the present, which then made
+    every subsequent get-new-leads call return empty (nothing can be
+    "after" a future date yet) - silently freezing the whole pipeline
+    for hours. At least 3 real leads in that window, including 2
+    Generic Interest ones, were never even fetched. This lead should
+    still be PROCESSED normally (it's a real lead, still gets its
+    template) - it just must not be allowed to decide how far the
+    checkpoint advances."""
+    now = datetime.now(timezone.utc)
+    far_future = (now + timedelta(hours=4)).strftime("%Y-%m-%dT%H:%M:%S.925Z")
+    normal_time = (now - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    leads = [
+        {"_id": "1", "phone": "9876543210", "name": "Corrupted Timestamp Lead",
+         "lead_source": "Ethics Orovia EOI Malad W v2 2907", "leadDate": far_future},
+        {"_id": "2", "phone": "9876543211", "name": "Normal Lead",
+         "lead_source": "Ethics Orovia EOI Malad W v2 2907", "leadDate": normal_time},
+    ]
+    indihomes = FakeIndihomesClient(leads=leads, project=None)
+    wati = FakeWatiClient()
+    patch_clients(indihomes=indihomes, wati=wati)
+
+    await campaign_worker.run_cycle()
+
+    # Checkpoint must advance to the NORMAL lead's time, not the
+    # corrupted future one - otherwise the next cycle's afterDate would
+    # be in the future and find nothing, ever, until real time catches up.
+    assert checkpoint.get_after_date() == normal_time
+    # Both leads are still processed normally - the future timestamp
+    # only affects checkpoint advancement, not whether the lead itself
+    # gets its template.
+    assert len(wati.sent_templates) == 2
 
 
 @pytest.mark.asyncio
