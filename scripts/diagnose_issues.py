@@ -39,7 +39,7 @@ import httpx  # noqa: E402
 
 from config import get_settings  # noqa: E402
 from integrations.indihomes_client import get_indihomes_client  # noqa: E402
-from services import property_service  # noqa: E402
+from services import campaign_context, property_service  # noqa: E402
 from utils import sent_template_store  # noqa: E402
 from utils.helpers import normalize_phone  # noqa: E402
 
@@ -59,9 +59,11 @@ def _check_ledger(lead_id: str) -> None:
     print(f"Ledger path: {ledger_path}")
     if not os.path.exists(ledger_path):
         print("!! state/sent_templates.json does NOT EXIST.")
-        print("   This means the duplicate-send guard is NOT active.")
-        print("   Either the service never ran since the ledger was added,")
-        print("   OR the Railway deploy doesn't persist the state/ directory.")
+        print("   NOTE: this is expected/normal if no lead has been sent a template")
+        print("   since this container started - has_sent()/mark_sent() only ever")
+        print("   write to this file on an actual send, they don't create it upfront.")
+        print("   Only a real concern if it's STILL missing after a real send has")
+        print("   happened since this deploy went live.")
         return
 
     with open(ledger_path, "r", encoding="utf-8") as f:
@@ -94,7 +96,9 @@ def _dump_ledger() -> None:
         "state", "sent_templates.json"
     )
     if not os.path.exists(ledger_path):
-        print("!! state/sent_templates.json does NOT EXIST - no ledger yet.")
+        print("!! state/sent_templates.json does NOT EXIST yet.")
+        print("   Expected/normal if nothing's been sent since this container started -")
+        print("   see the note in _check_ledger for the same point in more detail.")
         return
 
     with open(ledger_path, "r", encoding="utf-8") as f:
@@ -202,18 +206,45 @@ async def _lookup_project_by_name(name: str) -> None:
 
 
 async def _check_campaign_context_store() -> None:
-    """Check the campaign context store (in-memory + disk if persisted)."""
+    """Check the campaign context store (in-memory + disk if persisted).
+
+    IMPORTANT (fixed 4 Aug 2026): this used to check ONLY whether
+    state/campaign_context.json exists on disk, and printed "in-memory
+    ONLY, here's the fix" whenever it didn't - conflating two very
+    different situations: the persistence CODE genuinely missing from
+    this deploy, vs. the code being present but no lead having
+    triggered a write yet on a fresh container. That caused a real,
+    confirmed false alarm: a freshly-redeployed service (right after
+    fixing an unrelated volume-mount crash loop) hadn't processed any
+    real Property Campaign lead yet, so campaign_context.json didn't
+    exist - and this check reported the OLD, already-fixed bug as if
+    it were still present, sending troubleshooting in the wrong
+    direction. Now checks the CODE first (does campaign_context have
+    _CONTEXT_PATH at all?), completely independent of whether the file
+    happens to exist yet.
+    """
     print(f"\n{SECTION}")
     print("[4] CAMPAIGN CONTEXT STORE CHECK")
     print(SECTION)
 
-    # Check if there's a persisted context store
+    has_persistence_code = hasattr(campaign_context, "_CONTEXT_PATH")
+    if not has_persistence_code:
+        print("  ❌ services/campaign_context.py has NO _CONTEXT_PATH attribute.")
+        print("     This deployment is running the OLD in-memory-only version - the")
+        print("     persistence fix genuinely was not included in whatever was deployed.")
+        print("     Fix: make sure services/campaign_context.py with the disk-persistence")
+        print("     code is actually committed, pushed, and part of the running deploy.")
+        return
+
+    print("  ✅ campaign_context.py HAS disk-persistence code (_CONTEXT_PATH present) -")
+    print("     the fix IS in this deployment's code, regardless of what's below.")
+
     context_path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "state", "campaign_context.json"
     )
     if os.path.exists(context_path):
-        print(f"  ✅ Persisted context store found at {context_path}")
+        print(f"\n  ✅ Persisted context store found at {context_path}")
         with open(context_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         entries = data.get("context", {})
@@ -223,14 +254,12 @@ async def _check_campaign_context_store() -> None:
         if len(entries) > 10:
             print(f"    ... and {len(entries) - 10} more")
     else:
-        print(f"  ❌ NO persisted context store at {context_path}")
-        print("  The campaign_context is in-memory ONLY.")
-        print("  After any restart/redeploy, all phone -> project_code mappings are LOST.")
-        print("  This is the root cause of {{project_name}} not resolving when the WATI")
-        print("  flow calls /property-detail after a restart: the in-memory lookup returns")
-        print("  None, and if the WATI contact attribute wasn't set either, we get found=no.")
-        print("\n  FIX: Persist campaign_context to state/campaign_context.json (same pattern")
-        print("  as sent_template_store.py). See the fix in services/campaign_context.py.")
+        print(f"\n  ℹ️  No file yet at {context_path}.")
+        print("     NORMAL for a fresh deploy/volume - remember() only writes on an actual")
+        print("     Property Campaign send, it doesn't create the file upfront. Only a real")
+        print("     concern if this is STILL empty after a real Property Campaign lead has")
+        print("     been sent a template since this deploy started - if so, check whether a")
+        print("     Railway Volume is actually mounted at the right path (see DOCUMENTATION.md).")
 
 
 async def main(
