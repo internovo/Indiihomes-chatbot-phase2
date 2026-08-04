@@ -182,8 +182,7 @@ async def process_generic_lead(
         record.mark_failed(str(exc), backoff_seconds=5 * 60)
         return record
 
-    # Past this point the message has DEFINITELY gone out - nothing
-    # below can change record.status back to something retryable.
+
     await _update_crm_status_after_send(indihomes_client, lead)
     return record
 
