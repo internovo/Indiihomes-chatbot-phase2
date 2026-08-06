@@ -33,6 +33,24 @@ class Settings(BaseSettings):
     # checkpoint from pulling the entire historical lead list.
     initial_lookback_hours: int = 24
 
+    # --- Business-hours gating (see business_hours.py,
+    # services/campaign_service.py, utils/pending_queue.py) ---
+    # When the daily off-hours-queue flush runs. Defaults to
+    # business_hours.BUSINESS_START (10:00 AM IST) DELIBERATELY, not the
+    # "9:00 AM" text in Indihomes_Business_Hours_Gating.docx §3.3 - that
+    # doc contradicts itself (its own code comment says "10:00 AM IST
+    # daily" over an hour=9 value, and §4 "End-to-End Flow" says
+    # "10:00 AM IST" outright). Flushing exactly AT business open, not an
+    # hour before it, is also the only choice that doesn't itself
+    # violate the gate: is_business_hours() would still read False at
+    # 9:00 AM, so a 9 AM flush job would immediately re-queue everything
+    # it just tried to send. See claude.md, "Business hours gating", for
+    # the full explanation. Configurable here (not hardcoded in the
+    # worker) exactly like every other worker interval in this file, in
+    # case business hours themselves ever change.
+    queue_flush_hour_ist: int = 10
+    queue_flush_minute_ist: int = 0
+
     # --- Advisor email notifications (POST /notify-advisor) ---
     # Brevo's HTTPS API only - see integrations/email_client.py for why
     # (works identically locally and on Railway; SMTP does not).

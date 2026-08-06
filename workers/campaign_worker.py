@@ -108,8 +108,16 @@ def _newest_timestamp(leads) -> str | None:
 def _summarize_and_queue(records, leads, processor, indihomes_client=None, wati_client=None):
     """Shared bookkeeping for either lead category: counts outcomes and
     hands RETRYING ones to retry_worker with the right processor to
-    retry them with. Returns (sent, queued, notified) counts."""
-    sent = queued = notified = 0
+    retry them with. Returns (sent, queued, notified, queued_off_hours) counts.
+
+    QUEUED_OFF_HOURS is deliberately NOT handed to retry_worker - it is
+    not a failure, it's a lead resolved and ready to send that arrived
+    outside business hours. It already persisted itself to
+    utils/pending_queue.py inside campaign_service.py; putting it into
+    retry_worker's in-memory backoff queue too would double-track the
+    same lead in two different queues with two different flush
+    schedules."""
+    sent = queued = notified = queued_off_hours = 0
     for lead, record in zip(leads, records):
         if record.status == CampaignStatus.TEMPLATE_SENT:
             sent += 1
@@ -118,7 +126,9 @@ def _summarize_and_queue(records, leads, processor, indihomes_client=None, wati_
             queued += 1
         elif record.status == CampaignStatus.ADVISOR_NOTIFIED:
             notified += 1
-    return sent, queued, notified
+        elif record.status == CampaignStatus.QUEUED_OFF_HOURS:
+            queued_off_hours += 1
+    return sent, queued, notified, queued_off_hours
 
 
 async def run_cycle() -> None:
@@ -162,16 +172,17 @@ async def run_cycle() -> None:
 
         if property_leads:
             records = await campaign_service.process_batch(property_leads, indihomes_client, wati_client)
-            sent, queued, notified = _summarize_and_queue(records, property_leads, campaign_service.process_lead)
+            sent, queued, notified, queued_off_hours = _summarize_and_queue(records, property_leads, campaign_service.process_lead)
             logger.info(
-                "Property Campaign cycle: %d sent, %d queued for retry, %d advisor-notified (no project data)",
-                sent, queued, notified,
+                "Property Campaign cycle: %d sent, %d queued for retry, %d advisor-notified (no project data), "
+                "%d queued off-hours",
+                sent, queued, notified, queued_off_hours,
             )
 
         if generic_leads:
             generic_records = await campaign_service.process_generic_batch(generic_leads, indihomes_client, wati_client)
-            sent, queued, _ = _summarize_and_queue(generic_records, generic_leads, campaign_service.process_generic_lead)
-            logger.info("Generic Interest cycle: %d sent, %d queued for retry", sent, queued)
+            sent, queued, _, queued_off_hours = _summarize_and_queue(generic_records, generic_leads, campaign_service.process_generic_lead)
+            logger.info("Generic Interest cycle: %d sent, %d queued for retry, %d queued off-hours", sent, queued, queued_off_hours)
 
     if newest_seen:
         checkpoint.save_checkpoint(newest_seen)

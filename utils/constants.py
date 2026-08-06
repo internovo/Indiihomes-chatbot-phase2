@@ -37,6 +37,13 @@ class CampaignStatus:
     FAILED = "failed"
     RETRYING = "retrying"
     ABANDONED = "abandoned"
+    # Business-hours gating (see services/campaign_service.py and
+    # utils/pending_queue.py): the lead resolved successfully and is
+    # ready to send, but arrived outside 10 AM - 7 PM IST. Queued to
+    # pending_queue.json instead of sent; NOT the same as RETRYING -
+    # this is not a failure and must never enter retry_worker's
+    # backoff queue. Drained once daily by workers/queue_flush_worker.py.
+    QUEUED_OFF_HOURS = "queued_off_hours"
     # Kept as a defensive safety net in campaign_service.process_lead,
     # though it should now be unreachable in normal operation: a lead
     # only ever reaches process_lead (Property Campaign) when

@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest  # noqa: E402
 
 from services import campaign_context  # noqa: E402
-from utils import checkpoint, sent_template_store  # noqa: E402
+from utils import checkpoint, pending_queue, sent_template_store  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -65,4 +65,16 @@ def isolate_checkpoint(tmp_path, monkeypatch):
     campaign_worker/checkpoint without adding its own local fixture."""
     fake_path = tmp_path / "checkpoint.json"
     monkeypatch.setattr(checkpoint, "_CHECKPOINT_PATH", str(fake_path))
+    yield
+
+
+@pytest.fixture(autouse=True)
+def isolate_pending_queue(tmp_path, monkeypatch):
+    """Same reasoning as isolate_sent_template_store above, for
+    state/pending_queue.json (business-hours gating - see
+    utils/pending_queue.py). Without this, any test that exercises the
+    off-hours queuing path writes into the REAL file on whatever
+    machine runs the tests."""
+    fake_path = tmp_path / "pending_queue.json"
+    monkeypatch.setattr(pending_queue, "_PENDING_QUEUE_PATH", str(fake_path))
     yield
