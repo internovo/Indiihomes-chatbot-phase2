@@ -60,6 +60,18 @@ class Settings(BaseSettings):
     advisor_emails: str = ""   # comma-separated, e.g. "a@x.com,b@x.com"
     notify_cc: str = ""        # comma-separated, optional oversight inbox(es)
 
+    # --- Phase 3: indihomes-lead-routing-service (salesperson notification) ---
+    # Blank lead_routing_url = the Phase 3 hook in campaign_service.py is a
+    # silent no-op, same convention as every other optional integration in
+    # this file. lead_routing_dry_run mirrors wati_client's own safety
+    # switch on the routing service side - keep this true until that
+    # service's own WATI_DRY_RUN has separately been confirmed safe to
+    # disable (see indihomes-lead-routing-service/README.md).
+    lead_routing_url: str = ""
+    lead_routing_shared_secret: str = ""
+    lead_routing_dry_run: bool = True
+    lead_routing_timeout_seconds: int = 15
+
     # --- Misc ---
     log_level: str = "INFO"
     environment: str = "development"

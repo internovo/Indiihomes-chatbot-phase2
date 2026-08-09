@@ -24,6 +24,7 @@ class NotifyAdvisorRequest(BaseModel):
     slot_label: Optional[str] = None
     advisor: Optional[str] = None
     lead_source: Optional[str] = None  # context for the two internal (non-webhook) reasons above
+    raw_message: Optional[str] = None  # what the lead actually typed, for reason="unclassified_freetext"
 
     model_config = {"extra": "ignore"}
 

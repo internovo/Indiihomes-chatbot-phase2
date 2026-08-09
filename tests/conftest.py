@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest  # noqa: E402
 
 from services import campaign_context  # noqa: E402
-from utils import checkpoint, pending_queue, sent_template_store  # noqa: E402
+from utils import checkpoint, opted_out_store, pending_queue, sent_template_store  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -77,4 +77,13 @@ def isolate_pending_queue(tmp_path, monkeypatch):
     machine runs the tests."""
     fake_path = tmp_path / "pending_queue.json"
     monkeypatch.setattr(pending_queue, "_PENDING_QUEUE_PATH", str(fake_path))
+    yield
+
+
+@pytest.fixture(autouse=True)
+def isolate_opted_out_store(tmp_path, monkeypatch):
+    """Same reasoning again, for state/opted_out.json (free-text
+    handling in the campaign flow - see utils/opted_out_store.py)."""
+    fake_path = tmp_path / "opted_out.json"
+    monkeypatch.setattr(opted_out_store, "_OPTED_OUT_PATH", str(fake_path))
     yield

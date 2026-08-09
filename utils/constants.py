@@ -44,6 +44,12 @@ class CampaignStatus:
     # this is not a failure and must never enter retry_worker's
     # backoff queue. Drained once daily by workers/queue_flush_worker.py.
     QUEUED_OFF_HOURS = "queued_off_hours"
+    # Free-text handling (see services/campaign_intent_router.py and
+    # utils/opted_out_store.py): the phone told us to stop. Checked
+    # BEFORE anything else in process_lead/process_generic_lead, so
+    # this is terminal and permanent for this phone - no retry, no
+    # off-hours queue, no future campaign send at all.
+    OPTED_OUT = "opted_out"
     # Kept as a defensive safety net in campaign_service.process_lead,
     # though it should now be unreachable in normal operation: a lead
     # only ever reaches process_lead (Property Campaign) when

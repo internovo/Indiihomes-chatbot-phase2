@@ -38,6 +38,7 @@ problem worth knowing about - the CRM won't show this lead as
 contacted), but the record stays TEMPLATE_SENT and is never retried.
 """
 from integrations.indihomes_client import IndihomesClient
+from integrations.lead_routing_client import notify_lead_routing_best_effort
 from integrations.wati_client import WatiClient
 from business_hours import is_business_hours
 from config import get_settings
@@ -45,7 +46,7 @@ from models.campaign import CampaignRecord
 from models.lead import Lead
 from models.notify import NotifyAdvisorRequest
 from services import campaign_context, notify_service, property_service, template_service
-from utils import pending_queue, sent_template_store
+from utils import opted_out_store, pending_queue, sent_template_store
 from utils.constants import CampaignStatus
 from utils.logger import get_logger
 
@@ -78,6 +79,15 @@ async def process_lead(
     retry worker) can decide what to do next - it never raises, since
     one bad lead shouldn't stop a whole worker cycle."""
     record = CampaignRecord(lead_id=lead.id, phone=lead.phone)
+
+    if opted_out_store.is_opted_out(lead.phone):
+        # Checked FIRST, before project resolution or anything else - a
+        # phone that told us to stop must never be contacted again by
+        # this pipeline, regardless of what project this particular
+        # lead record is about. See utils/opted_out_store.py.
+        logger.info("Lead %s (phone=%s) is opted out - skipping", lead.id, lead.phone)
+        record.status = CampaignStatus.OPTED_OUT
+        return record
 
     if not lead.project_code and not lead.project_name:
         # Defensive safety net, not an expected path: lead_service.classify_lead
@@ -152,6 +162,20 @@ async def process_lead(
 
     # Past this point the message has DEFINITELY gone out - nothing
     # below can change record.status back to something retryable.
+
+    # Phase 3: notify the resolved project's salesperson via
+    # indihomes-lead-routing-service. Fired in BOTH the fresh-send and
+    # duplicate-skip branches above (both reach here with record marked
+    # sent) - the routing service is itself idempotent per lead_id, so
+    # calling it again after a duplicate-skip is safe and is actually
+    # the point: it catches the case where the customer's template went
+    # out on a prior run but the salesperson notification silently
+    # failed that time. Isolated in its own try/except inside
+    # notify_lead_routing_best_effort() - same non-negotiable rule as
+    # _update_crm_status_after_send below: nothing here may ever
+    # re-trigger a resend of the CUSTOMER'S template.
+    await notify_lead_routing_best_effort(lead, prop)
+
     await _update_crm_status_after_send(indihomes_client, lead)
     return record
 
@@ -169,6 +193,11 @@ async def process_generic_lead(
     opening template. Everything after the lead taps it is WATI's own
     flow, not this service's concern."""
     record = CampaignRecord(lead_id=lead.id, phone=lead.phone)
+
+    if opted_out_store.is_opted_out(lead.phone):
+        logger.info("Lead %s (phone=%s) is opted out - skipping", lead.id, lead.phone)
+        record.status = CampaignStatus.OPTED_OUT
+        return record
 
     try:
         settings = get_settings()

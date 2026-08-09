@@ -27,6 +27,20 @@ _REASON_LABELS = {
     "site_visit_booked": "booked a site visit",
     "unresolved_project": "came in via a campaign source, but has no project_code or project_name to look up - needs manual follow-up",
     "lead_abandoned": "campaign lead couldn't be processed after all retries - needs manual follow-up",
+    # Free-text handling (see services/campaign_intent_router.py). Both
+    # fired from the NEW POST /interpret-message fallback when a lead
+    # types instead of tapping a button.
+    "site_visit_requested_freetext": (
+        "typed a site-visit request instead of tapping a button - route "
+        "manually, no automated booking path is wired for this flow yet"
+    ),
+    "not_interested_freetext": "typed that they're not interested",
+    # Fired from POST /interpret-message's kind=="none" branch (see
+    # routes/campaign.py) - free text campaign_intent_router.py couldn't
+    # classify into any of its five known intents. Sibling of Phase 1's
+    # needs_human logging (Indihomes-chatbot-V1/appointments_db.py); this
+    # flow has no local DB of its own, so an advisor email IS the log.
+    "unclassified_freetext": "typed something the bot couldn't classify - needs manual follow-up",
 }
 
 
@@ -49,6 +63,8 @@ def _body(req: NotifyAdvisorRequest) -> str:
         lines.append(f"Slot: {req.slot_label}")
     if req.advisor:
         lines.append(f"Assigned advisor (WATI): {req.advisor}")
+    if req.raw_message:
+        lines.append(f"Lead typed: {req.raw_message!r}")
     lines.append("")
     lines.append("This lead came from the Phase 2 campaign/portal WhatsApp flow.")
     return "\n".join(lines)

@@ -223,3 +223,309 @@ genuinely off-hours, confirmed queued via `/health`, then confirmed sent
 after the next day's 10:00 AM flush) - the automated tests above use
 `monkeypatch` on `is_business_hours()` directly rather than waiting for
 real off-hours, for the same reason Phase 1's tests do.
+
+---
+
+# TASK: Free-text handling in the campaign flow
+
+## The incident
+
+Confirmed live, 7 Aug 2026: a Property Campaign lead (Monali, referred for
+"Anchorpoint Aviara") received the opening template, tapped through to
+view details, and hit:
+
+```
+Bot: What would you like to do next?
+Bot: Indihomes
+```
+
+- a Buttons node. She then typed free text instead of tapping a button.
+The transcript captured cuts off exactly at this point - **what she
+actually typed was never captured**, so this fix could not be built
+against her real words the way Phase 1's `intent_router.py` was built
+against Megha's actual transcript.
+
+**The gap itself, independent of her specific words:** this campaign flow
+had NO equivalent of Phase 1's `intent_router.py`/`/interpret-message` at
+all. Any free text at this node - regardless of what it said - had
+nowhere to go. This is the same class of gap Megha's Phase 1 transcript
+exposed months earlier, just in a codebase that never got the
+corresponding fix.
+
+## What was built
+
+### 1. `services/campaign_intent_router.py` (new)
+
+A scoped sibling of Phase 1's `intent_router.py`. Deliberately NARROWER -
+five intents instead of Phase 1's five, but a DIFFERENT five, because this
+flow's action surface is smaller: one resolved project, no property
+search, and (confirmed by reading `routes/campaign.py`) no visible
+slot-listing/booking endpoint in this codebase:
+
+| Intent | Routed to |
+|---|---|
+| `stop` | `utils/opted_out_store.py` - see below |
+| `talk_to_advisor` | `notify_service.notify_advisor(reason="advisor_requested")` |
+| `site_visit` | `notify_advisor(reason="site_visit_requested_freetext")` - human handoff, see note below |
+| `not_interested` | `notify_advisor(reason="not_interested_freetext")` |
+| `show_details` | re-runs `campaign_property_service.resolve_campaign_property` |
+
+**`site_visit` is intentionally routed to a human, not any automated
+booking logic.** `routes/campaign.py` only exposes `/property-detail` and
+`/notify-advisor` - there is no `/available-slots` or `/book-slot`
+equivalent visible anywhere in this codebase. It's genuinely unclear
+whether this flow's site-visit booking happens via a WATI-native calendar
+integration, by calling Phase 1's booking endpoints directly, or some
+other mechanism not visible from the code alone. Guessing at that
+mechanism and wiring to it would risk a broken or duplicate booking path;
+handing off to a human is the only universally-safe default until that's
+confirmed. **Open question, not resolved here** - worth asking directly:
+how does this flow's "Book a Site Visit" button actually book anything
+today?
+
+### 2. THE HONESTY NOTE - read this before touching the phrase lists
+
+Unlike Phase 1's `intent_router.py`, whose phrase lists were built by
+reading Megha's ACTUAL words ("No one", "Send in borivali east also"),
+`campaign_intent_router.py`'s phrase lists are **inferred from the
+CATEGORY of message plausible at this node**, not grounded in Monali's
+real text - which was never captured. This is explicitly documented in
+the module's own docstring as a v0, not a finished feature.
+
+`POST /interpret-message` (below) logs every classification outcome,
+including `"none"`, at INFO specifically so this can be trued up once real
+data exists - the same iteration path Phase 1's router went through after
+Megha's transcript. **Do not treat this phrase list as calibrated until
+that happens.**
+
+### 3. `utils/opted_out_store.py` (new) + wired into `services/campaign_service.py`
+
+A Phase-2-specific do-not-contact list, separate from Phase 1's
+`appointments_db.opted_out` table (different codebase, no shared
+database). Same file-I/O pattern as `sent_template_store.py` /
+`pending_queue.py`.
+
+**Why Phase 2 needs its OWN copy of this concern, unlike most things
+(which only need to exist in one phase or the other):** Phase 2
+INITIATES contact. A phone that says "stop" here must not receive a
+FUTURE campaign send when some OTHER lead record for the same phone shows
+up later (a brand new Housing.com/Meta Ads form fill weeks after this
+one) - a scenario that only applies to a service that proactively
+messages people. Phase 1 never has this problem since it never initiates
+contact.
+
+Checked at the VERY TOP of `process_lead()` / `process_generic_lead()` -
+before project resolution, before the `has_sent()` idempotency check,
+before the business-hours gate. A new `CampaignStatus.OPTED_OUT` status
+marks this terminal outcome distinctly from `RETRYING`/`QUEUED_OFF_HOURS`
+- an opted-out lead is neither failing nor waiting, it's permanently done.
+
+### 4. `routes/campaign.py` - `POST /interpret-message` (new)
+
+Sibling of Phase 1's endpoint of the same name and same general shape
+(flat string fields, `intent`/`is_global`/`handled`/`reply_text`). Calls
+`campaign_intent_router.classify()`, dispatches to the five branches
+above, logs every outcome.
+
+**WATI wiring required - NOT done as part of this change.** Unlike Phase
+1's `/interpret-message`, which was wired directly into a provided flow
+JSON export, no campaign flow export was available to patch
+programmatically here. The wiring pattern to follow is documented in
+`Indihomes-chatbot-V1/claude.md`, "Required WATI wiring": find the "What
+would you like to do next?" Buttons node, set its default/no-match path
+(`interactiveButtonsDefaultNodeResultId`) to a new webhook node calling
+this endpoint, then branch on `is_global` the same way Phase 1's
+`main_condition-intglobal` does. **Also remember the `@`/`{{ }}` variable-
+syntax trap documented in that same file (Bug 1 of the post-deploy
+changelog)** when wiring the condition node - match the syntax to
+whichever `responseVariables` type the webhook's fields are mapped as, not
+by assumption.
+
+### 5. `services/notify_service.py` - two new reason labels
+
+`site_visit_requested_freetext` and `not_interested_freetext`, so an
+advisor's inbox clearly distinguishes a free-text-triggered notification
+from the existing button-triggered ones (`site_visit_no_slots`,
+`advisor_requested`).
+
+## Testing
+
+```bash
+cd Indiihomes-chatbot-phase2
+pytest tests/test_campaign_intent_router.py -v
+```
+
+Covers: `campaign_intent_router.classify()` for all five intents plus the
+empty/unrecognised cases; `opted_out_store.py`'s persistence round trip;
+the opt-out gate correctly skipping BOTH `process_lead` and
+`process_generic_lead` before any send, and NOT interfering with a normal
+(non-opted-out) send; and `POST /interpret-message` end to end for `stop`
+(confirms `opted_out_store` actually gets marked), `talk_to_advisor`,
+`site_visit` (confirms it notifies rather than attempting a booking),
+`not_interested`, `none`, and a minimal/empty body never erroring.
+
+Called directly as async functions (`await interpret_message(...)`),
+matching every other test file in this project's own convention - not
+`TestClient(app)`, which would also spin up `app.py`'s real
+`AsyncIOScheduler` lifespan and its four background jobs unnecessarily for
+a unit test.
+
+## Known limitations / open questions
+
+- **Phrase lists are unvalidated against real data** - see the honesty
+  note above. This is the most important limitation to remember.
+- **The site-visit booking mechanism for this flow is unknown** to this
+  implementation - `site_visit` hands off to a human specifically because
+  of that uncertainty. Resolving the open question (how does "Book a Site
+  Visit" actually book something today?) may make a more automated
+  `site_visit` handler possible later.
+- **WATI wiring is not done** - this endpoint exists and is tested, but
+  nothing in WATI Builder points to it yet. No flow export was available
+  to patch programmatically this time.
+- **`show_details` re-resolves via `campaign_context`**, which depends on
+  a `project_code` already having been remembered for this phone (set
+  when the original template was sent). If that lookup fails for any
+  reason, it notifies an advisor with `reason="unresolved_project"` rather
+  than leaving the customer with no response at all.
+
+---
+
+# CHANGELOG: Lead-safety-net - `"none"` intent now notifies an advisor
+
+## What was found
+
+While auditing Phase 1's equivalent fallback path (see
+`Indihomes-chatbot-V1/claude.md`, "Lead-safety-net"), the same gap turned
+up here: `routes/campaign.py`'s `POST /interpret-message`, `kind == "none"`
+branch returned `InterpretMessageResponse(intent="none", is_global="no",
+handled="no")` and did nothing else. WATI's `is_global=="no"` condition
+already falls through to whatever local retry copy that flow node has, so
+the customer was never shown a blank message - but nobody was ever told a
+lead hit a dead end here either.
+
+**Where this diverges from Phase 1's fix**: Phase 1 has a local SQLite
+database (`appointments_db.py`) to log an unresolved lead into. This
+codebase has no local DB of its own for lead state - `notify_service.py`'s
+advisor email already IS the log for every other unhandled case in this
+file (`unresolved_project`, `lead_abandoned`, the two `*_freetext` reasons
+below it). So the fix here is an advisor email, not a DB row.
+
+## What was built
+
+### 1. `models/notify.py` - `raw_message` field (new)
+
+Optional field on `NotifyAdvisorRequest`, carrying what the lead actually
+typed. Only populated for the new `unclassified_freetext` reason below -
+every other existing reason already has enough context (project, slot,
+advisor) without needing the raw text.
+
+### 2. `services/notify_service.py` - `unclassified_freetext` reason (new)
+
+Added to `_REASON_LABELS`, and `_body()` now includes a `Lead typed: ...`
+line whenever `req.raw_message` is set (every other reason leaves it
+unset, so this is additive and doesn't touch existing email bodies).
+
+### 3. `routes/campaign.py` - `kind == "none"` branch (patched)
+
+Now calls `notify_service.notify_advisor(...)` with
+`reason="unclassified_freetext"` and the raw text, best-effort (the
+function already swallows its own errors and returns a bool - same
+contract as every other call site in this file), before returning the
+same `InterpretMessageResponse` as before. No change to the customer-
+facing behaviour; the only difference is an advisor now gets an email.
+
+**Deliberately unthrottled**, matching how every other reason in this file
+already behaves (one email per event, no rate limiting) - consistent with
+the existing pattern rather than a special case for this one reason. If
+real traffic shows this getting noisy (e.g. a lead repeatedly sending
+gibberish), the fix is to add throttling to `notify_service.notify_advisor`
+itself so every reason benefits, not just this one.
+
+## Testing
+
+No new automated test added - `tests/test_campaign_intent_router.py`
+already has a `"none"` case (see that file's existing coverage); extending
+it to assert `notify_advisor` gets called is the natural next step but
+wasn't done as part of this pass. Manual check:
+
+```bash
+curl -X POST http://localhost:8000/interpret-message \
+  -H "Content-Type: application/json" \
+  -d '{"phone": "919999900199", "message": "asdkjfh gibberish"}'
+# Expect: 200, {"intent": "none", "is_global": "no", "handled": "no"} - same
+# response shape as before. Check logs / Brevo dashboard (or the console
+# log line if BREVO_API_KEY isn't set) for an advisor email with subject
+# containing "typed something the bot couldn't classify".
+```
+
+## Known limitations
+
+- **No local log of unclassified messages in this codebase** - the advisor
+  email is the only record. If Brevo is misconfigured (`BREVO_API_KEY` not
+  set), `email_client.send()` only logs the email content at INFO level
+  rather than actually notifying anyone - worth confirming this is
+  configured in production before relying on this as the safety net it's
+  meant to be.
+- **Still no WATI wiring for this endpoint at all** - the pre-existing
+  limitation from the "Free-text handling in the campaign flow" section
+  above still applies; this change only fixes what happens once a message
+  DOES reach `/interpret-message`, not whether WATI is actually calling it
+  yet.
+
+---
+
+# CHANGELOG (Phase 1 note, recorded here too since Phase 1's own claude.md
+# already covers it in full): the fallback nodes were dead ends
+
+Live-tested by the team (Yashh Rane) right after importing the
+lead-safety-net flow: reaching `main_message-fb-fallback` at the priority
+question left the conversation with nothing listening for the next
+message. Fixed in `Indihomes-main_v3_lead-safety-net.json` (Phase 1) by
+looping `main_message-fb-ack` / `main_message-fb-fallback` into a new
+`main_question-fb-continue` → `main_webhook-fb-continue` →
+`main_condition-fb-stop` cycle, with `stop` carved out to a genuine
+terminal message instead of looping. See
+`Indihomes-chatbot-V1/claude.md`, "Lead-safety-net", for the full detail -
+noted here only because Phase 2's `campaign_intent_router` flow (once
+wired) will need the identical fix once it has its own button-node
+defaults, so don't repeat the same dead-end mistake there.
+
+---
+
+# Phase 3 — Lead routing to salesperson (new)
+
+**What changed:** `process_lead()` in `services/campaign_service.py` now
+calls the NEW `indihomes-lead-routing-service` (separate repo,
+`C:\Users\admin\Desktop\indihomes-lead-routing-service`) right after the
+customer's opening WATI template send succeeds - fired in BOTH the
+fresh-send branch and the `sent_template_store`-duplicate-skip branch,
+since the routing service is itself idempotent per `lead.id` and this
+catches the case where the customer template went out on a prior cycle
+but the salesperson notification silently failed that time.
+EXPLICITLY NOT called from `process_generic_lead()` - Generic Interest
+leads have no `project_code` to resolve a salesperson against.
+
+**New file:** `integrations/lead_routing_client.py` - same shape as
+`integrations/wati_client.py` / `integrations/indihomes_client.py`
+(httpx.AsyncClient, `with_retry`, lazy singleton). Exposes
+`notify_lead_routing_best_effort(lead, prop)`, which NEVER raises - same
+non-negotiable rule as `_update_crm_status_after_send`: this fires AFTER
+the WATI send to the CUSTOMER already succeeded, so nothing here may ever
+cause that to be retried (a retry would re-send the customer's own
+template, not just re-notify the salesperson).
+
+**New config fields** (`config.py`): `lead_routing_url`,
+`lead_routing_shared_secret`, `lead_routing_dry_run` (default `True`),
+`lead_routing_timeout_seconds`. Blank `lead_routing_url` = the hook is a
+silent no-op, same pattern as every other optional integration in this
+file (e.g. blank `BREVO_API_KEY`).
+
+**Idempotency key sent:** `meta_ads:{lead.id}` - matches the routing
+service's own idempotency contract
+(`indihomes-lead-routing-service/app/utils/idempotency.py`), so a repeat
+call for the same lead never double-messages a salesperson even across
+multiple Phase 2 cycles.
+
+See `indihomes-lead-routing-service/README.md` for the full Phase 3
+design, including the one open verification item (confirming the real
+Cosmos `salesPerson`/`salesPersonNumber` field names before going live).
