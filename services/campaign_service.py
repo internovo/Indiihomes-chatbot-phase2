@@ -46,7 +46,7 @@ from models.campaign import CampaignRecord
 from models.lead import Lead
 from models.notify import NotifyAdvisorRequest
 from services import campaign_context, notify_service, property_service, template_service
-from utils import opted_out_store, pending_queue, sent_template_store
+from utils import lead_send_lock, opted_out_store, pending_queue, sent_template_store
 from utils.constants import CampaignStatus
 from utils.logger import get_logger
 
@@ -130,30 +130,41 @@ async def process_lead(
     prop.project_name,
 )
         payload = template_service.build_template_payload(lead, prop)
-        if sent_template_store.has_sent(lead.id, payload["template_name"]):
-            record.mark_sent()
-            logger.warning(
-                "Skipping duplicate campaign template send for lead %s template %s - already recorded as sent",
-                lead.id, payload["template_name"],
-            )
-        elif not is_business_hours():
-            # Resolved and ready to send, but outside 10 AM - 7 PM IST.
-            # Queue instead of sending - see Indihomes_Business_Hours_Gating.docx
-            # §3.3 and utils/pending_queue.py. Deliberately checked AFTER the
-            # has_sent() idempotency check above (a lead already sent must
-            # never be re-queued) and returns immediately, so nothing below
-            # this branch - including _update_crm_status_after_send - runs
-            # for an off-hours lead; the CRM must not show it as contacted
-            # until it actually has been.
-            pending_queue.enqueue(lead, category="property_campaign")
-            record.status = CampaignStatus.QUEUED_OFF_HOURS
-            logger.info("Lead %s queued off-hours for project %s", lead.id, prop.project_name)
-            return record
-        else:
-            await wati_client.send_template(payload["phone"], payload["template_name"], payload["parameters"])
-            sent_template_store.mark_sent(lead.id, payload["template_name"])
-            record.mark_sent()
-            logger.info("Campaign template sent to lead %s for project %s", lead.id, prop.project_name)
+
+        # See utils/lead_send_lock.py's module docstring for the exact
+        # duplicate-send race this closes: campaign_worker's regular poll
+        # and queue_flush_worker's daily cron can both reach this point
+        # for the SAME lead_id (a queued-off-hours lead whose CRM status
+        # was never updated still looks "new" to the regular poller).
+        # Held for the ENTIRE check-through-mark_sent section, including
+        # the awaited WATI send itself - not just the has_sent() read -
+        # since the race is between the CHECK and the MARK, not just
+        # around the check alone.
+        async with lead_send_lock.guard(lead.id):
+            if sent_template_store.has_sent(lead.id, payload["template_name"]):
+                record.mark_sent()
+                logger.warning(
+                    "Skipping duplicate campaign template send for lead %s template %s - already recorded as sent",
+                    lead.id, payload["template_name"],
+                )
+            elif not is_business_hours():
+                # Resolved and ready to send, but outside 10 AM - 7 PM IST.
+                # Queue instead of sending - see Indihomes_Business_Hours_Gating.docx
+                # §3.3 and utils/pending_queue.py. Deliberately checked AFTER the
+                # has_sent() idempotency check above (a lead already sent must
+                # never be re-queued) and returns immediately, so nothing below
+                # this branch - including _update_crm_status_after_send - runs
+                # for an off-hours lead; the CRM must not show it as contacted
+                # until it actually has been.
+                pending_queue.enqueue(lead, category="property_campaign")
+                record.status = CampaignStatus.QUEUED_OFF_HOURS
+                logger.info("Lead %s queued off-hours for project %s", lead.id, prop.project_name)
+                return record
+            else:
+                await wati_client.send_template(payload["phone"], payload["template_name"], payload["parameters"])
+                sent_template_store.mark_sent(lead.id, payload["template_name"])
+                record.mark_sent()
+                logger.info("Campaign template sent to lead %s for project %s", lead.id, prop.project_name)
 
     except Exception as exc:  # noqa: BLE001 - a failing lead must not crash the batch
         logger.error("Lead %s failed: %s", lead.id, exc)
@@ -208,25 +219,29 @@ async def process_generic_lead(
             # this must be the position number, not a descriptive label.
             {"name": "1", "value": lead.name or "there"},
         ]
-        if sent_template_store.has_sent(lead.id, template_name):
-            record.mark_sent()
-            logger.warning(
-                "Skipping duplicate campaign template send for lead %s template %s - already recorded as sent",
-                lead.id, template_name,
-            )
-        elif not is_business_hours():
-            # Same gate as process_lead's - see the comment there for the
-            # full reasoning. No property to reference in the log line
-            # here since Generic Interest leads never resolve one.
-            pending_queue.enqueue(lead, category="generic_interest")
-            record.status = CampaignStatus.QUEUED_OFF_HOURS
-            logger.info("Lead %s queued off-hours (generic interest)", lead.id)
-            return record
-        else:
-            await wati_client.send_template(lead.phone, template_name, parameters)
-            sent_template_store.mark_sent(lead.id, template_name)
-            record.mark_sent()
-            logger.info("Generic-interest template sent to lead %s (source=%r)", lead.id, lead.lead_source)
+
+        # Same duplicate-send race as process_lead above - see
+        # utils/lead_send_lock.py's module docstring.
+        async with lead_send_lock.guard(lead.id):
+            if sent_template_store.has_sent(lead.id, template_name):
+                record.mark_sent()
+                logger.warning(
+                    "Skipping duplicate campaign template send for lead %s template %s - already recorded as sent",
+                    lead.id, template_name,
+                )
+            elif not is_business_hours():
+                # Same gate as process_lead's - see the comment there for the
+                # full reasoning. No property to reference in the log line
+                # here since Generic Interest leads never resolve one.
+                pending_queue.enqueue(lead, category="generic_interest")
+                record.status = CampaignStatus.QUEUED_OFF_HOURS
+                logger.info("Lead %s queued off-hours (generic interest)", lead.id)
+                return record
+            else:
+                await wati_client.send_template(lead.phone, template_name, parameters)
+                sent_template_store.mark_sent(lead.id, template_name)
+                record.mark_sent()
+                logger.info("Generic-interest template sent to lead %s (source=%r)", lead.id, lead.lead_source)
 
     except Exception as exc:  # noqa: BLE001 - a failing lead must not crash the batch
         logger.error("Generic lead %s failed: %s", lead.id, exc)

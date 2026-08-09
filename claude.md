@@ -529,3 +529,106 @@ multiple Phase 2 cycles.
 See `indihomes-lead-routing-service/README.md` for the full Phase 3
 design, including the one open verification item (confirming the real
 Cosmos `salesPerson`/`salesPersonNumber` field names before going live).
+
+---
+
+# CHANGELOG: fixed a real duplicate-send bug - leads getting the campaign template twice
+
+## What was found
+
+Reported directly from production: leads ("N" / Kolte Patil Verve,
+"Teja Singh" / Sushanku Avenue 37, "Hitesh" / Ariha Opulence, and
+"almost all" leads per the report) each received the opening WATI
+template TWICE - one send correlating with business-hours open, one at
+an unpredictable ("dynamic") time. The two copies sometimes differed
+slightly in personalization (markdown asterisks around the project
+name present in one copy and not the other, extra whitespace in a
+name), consistent with each send having independently re-resolved the
+lead rather than being a single send somehow delivered twice.
+
+## Root cause
+
+`utils/sent_template_store.py`'s `has_sent()` / `mark_sent()` are two
+separate, non-atomic file operations, with real `await` points
+(`property_service.resolve_property`, `wati_client.send_template`)
+sitting between the check and the mark inside
+`services/campaign_service.py`'s `process_lead()` / `process_generic_lead()`.
+
+`workers/campaign_worker.py`'s regular 45-second poll and
+`workers/queue_flush_worker.py`'s once-daily 10:00 AM IST cron both run
+on the SAME asyncio event loop (see `app.py`'s `lifespan`) and can both
+end up calling `process_lead()` for the SAME lead_id: a lead queued
+off-hours has its CRM status left untouched until an ACTUAL send
+succeeds (`_update_crm_status_after_send` only runs after a real send -
+see that function's own docstring), so a still-queued lead can still
+look "new" to the CRM's own `get-new-leads` filter and get re-fetched
+by the regular poller around the same time `queue_flush_worker` is
+draining it from `pending_queue.json`. If both reach the `has_sent()`
+check before either has called `mark_sent()`, both see `False` and both
+proceed to actually call `wati_client.send_template()` - a genuine
+double send to a real customer, not a display/logging artifact.
+
+This is the exact class of bug `Indihomes-chatbot-V1/conversation_lock.py`
+already exists to prevent on the Phase 1 side (search, save-lead,
+book-slot); Phase 2 never had the equivalent lock around its own send
+path.
+
+## What was built
+
+**`utils/lead_send_lock.py`** (new) - a per-`lead_id` `asyncio.Lock`,
+exposed as `async with lead_send_lock.guard(lead.id): ...`. In-memory,
+not persisted (same tradeoff already accepted for `campaign_worker`'s
+own `_processed_lead_ids` set) - both workers that need this share one
+process/event loop, so a lock that resets on restart is fine.
+
+**`services/campaign_service.py`** - the entire `has_sent()`-check-
+through-`mark_sent()` section in both `process_lead()` and
+`process_generic_lead()` is now wrapped in `async with lead_send_lock.
+guard(lead.id):`. Whichever caller (regular poll or flush) gets there
+first runs the whole section - including the awaited WATI send -
+uninterrupted; the second caller blocks until the first finishes, then
+re-checks `has_sent()` (now `True`) and correctly skips instead of
+racing. The `QUEUED_OFF_HOURS` early `return record` inside the lock
+block still releases the lock correctly (Python context managers run
+`__aexit__` on any exit path, including an early `return`).
+
+## Testing
+
+`tests/test_campaign_worker.py` -
+`test_process_lead_does_not_double_send_when_called_concurrently_for_the_same_lead`
+(new): calls `process_lead()` twice concurrently via `asyncio.gather`
+for the same lead, using a `SlowWatiClient` whose `send_template()`
+deliberately yields control mid-call (`asyncio.sleep`) to force the
+exact interleaving that made the race possible in production. Asserts
+exactly one WATI send happens. Run:
+
+```powershell
+cd C:\Users\admin\Desktop\Indiihomes-chatbot-phase2
+python -m pytest tests/test_campaign_worker.py -v
+```
+
+Manual sanity check before trusting this in production: deploy, then
+watch `state/sent_templates.json` and `state/pending_queue.json` for a
+few real leads that arrive close to business-hours open - a lead
+should appear in `sent_templates.json` exactly once, and be removed
+from `pending_queue.json` the same cycle it's marked sent, never both
+queued AND independently sent again later the same day.
+
+## Known limitations
+
+- **This closes the race between workers in ONE process.** If this
+  service is ever scaled to more than one running instance (multiple
+  Railway replicas), an in-memory per-process lock can't coordinate
+  across processes - `sent_template_store`'s file-based check would
+  still be the only guard at that point, and this same race would
+  reopen across instances. Not a concern at the current single-instance
+  deployment, but worth remembering before ever scaling this service
+  horizontally - a distributed lock (e.g. backed by the same Railway
+  Volume, or Cosmos) would be needed at that point, not this fix.
+- **Doesn't address why a queued lead's CRM status looks "new" to the
+  regular poller in the first place** - the lock prevents the resulting
+  double SEND, but the underlying re-fetch of an already-queued lead
+  still happens on every poll cycle until it's actually sent. Harmless
+  now (it just re-queues in place, per `pending_queue.enqueue()`'s own
+  idempotent-by-lead_id behavior) but worth knowing if pending_queue
+  ever grows large enough that redundant re-fetches become a real cost.

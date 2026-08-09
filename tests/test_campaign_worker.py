@@ -419,3 +419,59 @@ async def test_run_cycle_does_not_resend_after_restart_when_crm_update_fails(pat
     assert retry_worker.pending_count() == 0
 
 
+import asyncio
+
+
+class SlowWatiClient(FakeWatiClient):
+    """Same as FakeWatiClient, but send_template yields control back to
+    the event loop before recording the send - opens the exact race
+    window utils/lead_send_lock.py exists to close: without the lock,
+    two concurrent callers can both pass the has_sent() check before
+    either has reached mark_sent(), since a real network await sits
+    between them in production (property_service resolution / the WATI
+    HTTP call itself)."""
+
+    async def send_template(self, phone, template_name, parameters):
+        await asyncio.sleep(0.05)
+        return await super().send_template(phone, template_name, parameters)
+
+
+@pytest.mark.asyncio
+async def test_process_lead_does_not_double_send_when_called_concurrently_for_the_same_lead(
+    temp_sent_template_store,
+):
+    """Regression for the real production symptom: leads receiving the
+    campaign template twice, one send correlating with business-hours
+    open (queue_flush_worker's cron) and one at an unpredictable time
+    (campaign_worker's regular poll re-fetching the same lead, e.g.
+    because its CRM status was never updated while it sat queued -
+    see campaign_service.py's module docstring). Both entry points call
+    process_lead() for the SAME lead_id; without utils/lead_send_lock.py
+    serializing the has_sent-check-through-mark_sent section, both can
+    pass the check before either marks it sent.
+
+    Simulates that race directly: two concurrent process_lead() calls
+    for the same lead, using a WATI client whose send_template()
+    deliberately yields control mid-call (SlowWatiClient) to force the
+    interleaving that made the race possible in production. Asserts
+    exactly ONE template send reaches WATI."""
+    lead = Lead(_id="race-1", phone="9876543210", name="Race Condition Lead",
+                lead_source="Housing.com", projectCode="INV_KP_VERVE",
+                projectName="Kolte Patil Verve")
+    indihomes = FakeIndihomesClient(leads=[], project={
+        "projectCode": "INV_KP_VERVE", "projectName": "Kolte Patil Verve",
+    })
+    wati = SlowWatiClient()
+
+    results = await asyncio.gather(
+        campaign_service.process_lead(lead, indihomes, wati),
+        campaign_service.process_lead(lead, indihomes, wati),
+    )
+
+    assert len(wati.sent_templates) == 1, (
+        f"expected exactly 1 WATI send, got {len(wati.sent_templates)} - "
+        "the duplicate-send race is not closed"
+    )
+    assert all(r.status == CampaignStatus.TEMPLATE_SENT for r in results)
+
+
