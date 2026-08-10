@@ -453,3 +453,170 @@ Both phases share the *same* `business_hours.py` (copied, not imported —
 they're separate deployments). Phase 2 *feeds* Phase 1. Neither knows how to
 do the other's job, and that clean separation is exactly why each one is
 testable and swappable on its own.
+
+---
+
+## 13. The duplicate-send race — two workers, one lead, no lock
+
+§7 already covered the idempotency ledger (`sent_template_store.py`)
+that stops a *retried* send from re-messaging a customer. This is a
+different, subtler version of the same danger class: **two workers
+racing each other**, not one worker retrying itself.
+
+### The symptom, reported directly from production
+
+Leads were receiving the opening template **twice** — one send
+correlating with business-hours open, one at an unpredictable
+("dynamic") time. The two copies sometimes differed slightly (markdown
+asterisks around a project name present in one and not the other,
+extra whitespace in a name) — a strong tell that each send
+independently *re-resolved* the lead, rather than one send somehow
+being delivered twice by the network.
+
+### Why two workers could reach the same lead at all
+
+Recall §8: an off-hours lead is queued, not sent, and its CRM status is
+deliberately left untouched until an ACTUAL send succeeds (so the CRM
+never shows "contacted" for a lead that's still waiting). That means a
+still-queued lead can still look "new" to the regular poller's CRM
+filter. Put those two facts together:
+
+```
+11:58 PM — lead arrives off-hours, gets queued (pending_queue.json)
+            CRM status: still "new" (untouched — see §8)
+            checkpoint may or may not have advanced past it yet
+
+10:00 AM — queue_flush_worker's cron fires: reads pending_queue,
+            calls process_lead() for this exact lead_id
+
+~same moment — campaign_worker's regular 45s poll ALSO re-fetches this
+            lead (CRM still says "new"), calls process_lead() for the
+            SAME lead_id
+```
+
+Both calls run on the **same asyncio event loop** (one Python process,
+see `app.py`'s `lifespan`). `sent_template_store.has_sent()` and
+`.mark_sent()` are two separate file operations with real `await`
+points between them (`property_service.resolve_property`,
+`wati_client.send_template`). If both callers reach `has_sent()`
+before either has reached `mark_sent()`, **both see `False`** and both
+proceed to actually call WATI. This is a textbook TOCTOU
+(time-of-check-to-time-of-use) race — the kind of bug that only shows
+up under real concurrency, never in a single manual test.
+
+### The fix — a per-lead lock around the WHOLE critical section
+
+`utils/lead_send_lock.py`: a per-`lead_id` `asyncio.Lock`, held for the
+*entire* check-through-send-through-mark section, not just the
+initial read:
+
+```python
+async with lead_send_lock.guard(lead.id):
+    if sent_template_store.has_sent(lead.id, template_name):
+        record.mark_sent()          # already done elsewhere — skip
+    elif not is_business_hours():
+        pending_queue.enqueue(lead, ...)
+        return record
+    else:
+        await wati_client.send_template(...)      # the network call
+        sent_template_store.mark_sent(lead.id, template_name)
+        record.mark_sent()
+```
+
+Whichever caller (poll or flush) gets there first now runs the whole
+section uninterrupted; the second caller *blocks* until the first
+finishes, then re-checks `has_sent()` — now `True` — and correctly
+skips instead of racing. In-memory, not persisted, same tradeoff
+already accepted for `_processed_lead_ids` (§4): both workers that
+need this share one process, so a lock that resets on restart is fine.
+
+**The generalizable lesson:** an idempotency *check* protects against
+retries of the same call. It does NOT automatically protect against
+two *different* callers reaching that check concurrently — that needs
+an actual lock around the check-and-act section, not just a
+check-before-acting pattern. This is the exact same class of bug
+`Indihomes-chatbot-V1/conversation_lock.py` already existed to prevent
+on the Phase 1 side; Phase 2 simply hadn't needed the equivalent until
+two scheduled workers could legitimately touch the same lead.
+
+### A real, separate lesson from fixing this: files can vanish between writing and deploying
+
+After this fix was written, Railway crashed on the very next deploy —
+an import error for `utils.lead_send_lock`, the module this fix
+depends on. The cause turned out to be almost comically literal: the
+new file existed on disk right after being created, but by the time
+things were committed and pushed, it simply wasn't there anymore —
+and because `campaign_service.py`'s import line for it *was* already
+committed, the broken state got pushed as "clean" (`git status` showed
+nothing to commit, because there was nothing left to notice was
+missing).
+
+**The practical habit this justifies:** after any multi-file change,
+confirm every new file is still present immediately before committing
+— `git status` telling you "working tree clean" only means "matches
+what git already knows about," not "everything that should exist,
+does."
+
+---
+
+## 14. The Phase 3 hook — notifying a salesperson after a successful send
+
+Mirroring Phase 1's own hook (see that repo's understand.md §12),
+`process_lead()` fires one more call after a template genuinely goes
+out: `notify_lead_routing_best_effort(lead, prop)`, a POST to
+`indihomes-lead-routing-service` (Phase 3).
+
+```python
+# past this point the CUSTOMER'S message has definitely gone out —
+# nothing below this can ever re-trigger a resend
+await notify_lead_routing_best_effort(lead, prop)
+await _update_crm_status_after_send(indihomes_client, lead)
+```
+
+**Deliberately fired from BOTH the fresh-send branch and the
+duplicate-skip branch above it** — both reach this point with the
+record already marked sent. That's not an accident: it means if the
+customer's template went out on a previous run but the salesperson
+notification silently failed *that* time (Phase 3 unreachable, a
+transient error), a later duplicate-skip pass still gets a chance to
+retry just the notification — without ever risking a second customer
+message, since that branch never reaches `wati_client.send_template`
+at all.
+
+**Also currently a safe no-op in production** for the same reason as
+Phase 1's copy of this hook: `LEAD_ROUTING_URL` in this repo's `.env`
+is still a localhost placeholder, because the routing service hasn't
+been deployed anywhere yet. See
+`../indihomes-lead-routing-service/understand.md` for the full design
+of what happens on the other end of this call, and its `claude.md` for
+the concrete blockers (deployment, a real Cosmos key, unverified
+salesperson field names) still standing between this hook being wired
+and it actually notifying anyone.
+
+Updated picture of §12's diagram, with Phase 3 added:
+
+```
+   HOUSING.COM / META ADS form                CUSTOMER opens WhatsApp
+             │                                        │
+             ▼                                        │
+      Indihomes CRM  ◄──── new lead                   │
+             │                                        │
+   ┌─────────┴──────────┐                             │
+   │  PHASE 2 (proactive)│                            │
+   │  poll every 45s     │                            │
+   │  send opening       │                            │
+   │  template           │                            │
+   └──┬───────────────┬──┘                             │
+      │ Priya taps    │ notify_lead_routing_best_effort │
+      │ "Interested"  ▼                                 ▼
+      │        ┌─────────────────────────────────────────┐
+      │        │  indihomes-lead-routing-service (Phase 3) │
+      │        │  resolves salesperson in Cosmos,          │
+      │        │  notifies THEM on WhatsApp                │
+      │        └─────────────────────────────────────────┘
+      ▼                                                 ▲
+ ┌──────────────────────────────────────────────────┐   │
+ │  PHASE 1 (reactive) — the qualification flow      │───┘ (also calls Phase 3
+ │  area → budget → BHK → search → book → save-lead  │      from /save-lead)
+ └──────────────────────────────────────────────────┘
+```

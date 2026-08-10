@@ -632,3 +632,65 @@ queued AND independently sent again later the same day.
   now (it just re-queues in place, per `pending_queue.enqueue()`'s own
   idempotent-by-lead_id behavior) but worth knowing if pending_queue
   ever grows large enough that redundant re-fetches become a real cost.
+
+---
+
+# INVESTIGATION: multi-property selection bug ('1 & 2') - does NOT apply here
+
+## Context
+
+Phase 1 shipped a fix for a real production bug (Smriti transcript): a
+customer replying "1 & 2" to "Which one would you like to see in detail?"
+only ever saw property #1, because `_parse_choice()` used `re.search(r"\d+",
+choice)` - first match only, silently dropping every number after the
+first. See `Indihomes-chatbot-V1/claude.md`, "multi-property selection",
+for the full writeup. Asked to port the same fix here.
+
+## Finding: this codebase has no equivalent bug to fix
+
+Checked `models/property_detail.py`, `routes/campaign.py`, and
+`services/campaign_property_service.py` directly before assuming a port
+was needed. **There is no numbered-list flow anywhere in Phase 2.**
+
+`PropertyDetailRequest` (the wire format for the campaign flow's
+`/property-detail` webhook) has exactly two fields: `phone` and
+`project_code`. There is no `choice` field, no shortlist, no
+`_parse_choice`/`_parse_choices` equivalent anywhere in this codebase to
+even contain the bug. Structurally, this is because Phase 2's campaign
+flow works completely differently from Phase 1's: every Property Campaign
+lead is ALREADY resolved to exactly ONE specific project before the
+customer ever replies to anything - either via the `project_code` WATI
+passes directly, or via `campaign_context`'s phone-to-project_code mapping
+recorded at the moment the opening template was sent
+(`campaign_property_service.resolve_campaign_property`). There is no
+moment in this flow where a customer is shown several numbered properties
+and asked to pick - the entire "reply with a number, we resolve it against
+a saved shortlist" mechanism Phase 1's bug lived inside simply isn't part
+of this architecture.
+
+Also checked `services/campaign_intent_router.py`'s `classify()` for the
+same CLASS of bug (a first-match-only parser silently dropping additional
+valid input) in case it showed up somewhere unexpected. It doesn't: its
+phrase-priority ordering (`stop` checked before `talk_to_advisor` before
+`site_visit`...) is an INTENTIONAL single-intent-per-message design (`stop`
+must always win, per its own docstring), not an accidental truncation of a
+list the customer meant to fully specify. A message that genuinely mixes
+two intents ("not interested in this one, but tell me more about others")
+is a real, different, harder problem - multi-intent-in-one-message
+classification - not the numbered-list-truncation bug this investigation
+was checking for. Not fixed here, since it's out of scope for a straight
+port of the Phase 1 fix, and no production evidence exists yet that it's
+actually happening.
+
+## Conclusion
+
+**No code change made in this pass.** Forcing an artificial `_parse_choices`-
+style function into a codebase with nothing for it to parse would be
+inventing a fix for a problem that doesn't exist here, not porting a real
+one. Documenting the investigation itself (not just the non-outcome) so
+this doesn't get silently re-asked or re-investigated from scratch later -
+if Phase 2's campaign flow ever grows a genuine multi-property listing
+feature (e.g. a "here are 3 similar projects" recommendation flow), THIS
+is the section to revisit, and the Phase 1 fix
+(`Indihomes-chatbot-V1/app.py`'s `_parse_choices`) is the pattern to copy
+at that point - not before.
