@@ -72,6 +72,23 @@ class Settings(BaseSettings):
     lead_routing_dry_run: bool = True
     lead_routing_timeout_seconds: int = 15
 
+    # Defaults FALSE - see claude.md, "Meta Ads salesperson notification
+    # disabled" (2026-08-12), and understand.md §14 for the full story.
+    # models/lead.py has no configuration/budget fields at all - this
+    # repo's Lead model never captured them from the CRM in the first
+    # place, so every Meta Ads salesperson notification sent so far went
+    # out with "Looking For: -" and "Budget: -" (confirmed from real
+    # production messages). A notification missing the two most
+    # decision-relevant fields is worse than no notification - it reads
+    # as broken software to the salesperson receiving it, not "no data
+    # yet". Flip to true only once models/lead.py + lead_routing_client.py
+    # actually capture and forward real configuration/budget values from
+    # the CRM's raw lead payload (confirm the real field names first -
+    # see scripts/dump_get_new_leads_raw.py). Env var:
+    # LEAD_ROUTING_META_ADS_ENABLED=true (matches this field name exactly -
+    # pydantic-settings maps snake_case field -> SCREAMING_SNAKE env var).
+    lead_routing_meta_ads_enabled: bool = False
+
     # --- Misc ---
     log_level: str = "INFO"
     environment: str = "development"

@@ -694,3 +694,188 @@ feature (e.g. a "here are 3 similar projects" recommendation flow), THIS
 is the section to revisit, and the Phase 1 fix
 (`Indihomes-chatbot-V1/app.py`'s `_parse_choices`) is the pattern to copy
 at that point - not before.
+
+---
+
+# UPDATE: WATI wiring done + the site-visit booking open question resolved
+
+## Open question from "Free-text handling in the campaign flow" - now answered
+
+That section flagged: *"how does this flow's 'Book a Site Visit' button
+actually book anything today?"* - `site_visit` was routed to a human
+notification specifically because the mechanism was unknown.
+
+**Answered while patching the real `phase2-v3(prod)` WATI flow JSON**:
+`camp_webhook-slots` and `camp_webhook-book` in that flow point at
+`https://web-production-ea977.up.railway.app/available-slots` and
+`/book-slot` - **Phase 1's backend**, not this one. This campaign flow
+reuses Phase 1's real Google Calendar / booking infrastructure directly;
+there's no separate Phase 2 booking mechanism to build.
+
+## WATI wiring completed for `phase2-v3(prod)`
+
+The flow JSON was uploaded and patched directly (not hand-edited) -
+`phase2-v3_prod__updated.json`. Both `InteractiveButtons` nodes
+(`camp_buttons-confirm`, `camp_buttons-next`) now have their default paths
+wired to `POST /interpret-message`, each with its own self-contained
+5-condition chain (`stop`/`talk_to_advisor`/`site_visit`/`not_interested`/
+`show_details`), all routing to REAL existing nodes wherever one exists -
+including `site_visit` now correctly routing to the REAL
+`camp_webhook-slots` node (confirmed working per the discovery above),
+not a generic human-notification fallback the way
+`campaign_intent_router.py`'s own backend handler still does.
+
+**This means `campaign_intent_router.py`'s own `site_visit` handler
+(routing to `notify_advisor(reason="site_visit_requested_freetext")`) is
+now effectively BYPASSED for this specific WATI flow** - the flow's
+condition chain intercepts `site_visit` and jumps straight into the real
+booking flow before the backend's own reply_text would ever be shown. The
+backend handler still exists and still fires correctly for OTHER callers
+of `/interpret-message` (e.g. the Meta Ads flow, or any future flow that
+doesn't have its own real booking flow to jump into) - this is a case
+where the WATI-side wiring can be SMARTER than the generic backend
+fallback when it has more context available (a real, working node to
+route to) than the backend does. See `Indihomes-chatbot-V1/claude.md`'s
+"not these reject_all gap + two WATI flows patched" changelog for the full
+design writeup of this patch (built there since it covers both flows in
+one pass) - full mechanical detail not repeated here.
+
+## Known limitations updated
+
+- The "WATI wiring is not done" limitation from "Free-text handling in the
+  campaign flow" is **resolved** for `phase2-v3(prod)`. Still verify
+  visually in Builder after import (per the caution in the Phase 1
+  changelog referenced above) before trusting it live.
+- The "site-visit booking mechanism for this flow is unknown" limitation
+  is **resolved** - see above. `campaign_intent_router.py`'s own
+  `site_visit` handler remains a human-notification fallback for OTHER
+  callers where no real booking flow exists to jump into - this is correct
+  and intentional, not a leftover to clean up.
+- Phrase-list validation against real data (the honesty note) **still
+  applies** - unchanged by this update.
+
+---
+
+## Meta Ads salesperson notification disabled (2026-08-12)
+
+**What happened:** once `indihomes-lead-routing-service` (Phase 3) went
+live in production (`WATI_DRY_RUN=false`), real salesperson notifications
+started going out for Meta Ads leads with the "Looking For" and "Budget"
+fields both showing `-` (the template's own fallback for an empty
+value) - confirmed directly from real messages received on WhatsApp, e.g.:
+
+```
+Client Name: Nadeem sheikh
+Mobile No: ****6879
+Looking For: -
+Budget: -
+```
+
+**Root cause:** `models/lead.py`'s `Lead` model has never had
+`configuration` or `budget` fields, aliased or otherwise - it only
+captures `id`, `name`, `phone`, `lead_source`, `project_code`,
+`project_name`, `status`, and the two timestamp fields.
+`integrations/lead_routing_client.py`'s `_build_payload()` accordingly
+never included `configuration`/`budget` in the POST to Phase 3 at all -
+not a bug in Phase 3, not a bug in the payload-sending code, just data
+that was never captured from the CRM lead record in the first place.
+
+**Why this needed an immediate fix, not just a backlog item:** a
+salesperson notification missing the two fields most relevant to
+actually following up (what the customer wants, what they can spend)
+reads as broken software, not "we don't have that data yet." Worse than
+sending nothing at all.
+
+**The fix - disable, don't patch blind:** rather than guess at what the
+raw CRM lead JSON's actual field names for configuration/budget are (see
+`scripts/dump_get_new_leads_raw.py` for how to find out for real), Meta
+Ads salesperson notifications are disabled outright via a new settings
+flag, `lead_routing_meta_ads_enabled` (env var
+`LEAD_ROUTING_META_ADS_ENABLED`, defaults `false`). Gated in
+`services/campaign_service.py::process_lead()`, right where
+`notify_lead_routing_best_effort()` used to be called unconditionally:
+
+```python
+settings = get_settings()
+if settings.lead_routing_meta_ads_enabled:
+    await notify_lead_routing_best_effort(lead, prop)
+else:
+    logger.info("Phase 3 salesperson notification skipped for lead %s (...)", lead.id)
+```
+
+**What this does NOT affect:**
+- The customer-facing campaign template send (`wati_client.send_template`)
+  - completely unrelated code path, still sends normally.
+- Phase 1 (`Indihomes-chatbot-V1`)'s own Phase 3 hooks
+  (`notify_recommendations()` at `/search`, `route_lead()` at
+  `/save-lead`) - direct-website leads DO have real configuration/budget
+  data collected conversationally, so those are unaffected and still live.
+- `process_generic_lead()` - never called `notify_lead_routing_best_effort`
+  in the first place (Generic Interest leads have no project to resolve a
+  salesperson against), so nothing changed there.
+
+**Re-enabling this later requires, in order:**
+1. Run `scripts/dump_get_new_leads_raw.py` against a real Meta Ads lead to
+   see the actual raw field names for configuration/budget (if they exist
+   at all in the CRM record - they may simply not be collected by the ad
+   form, in which case this may need a product conversation, not a code
+   fix).
+2. Add the confirmed fields to `models/lead.py` with the correct alias.
+3. Update `integrations/lead_routing_client.py::_build_payload()` to
+   forward them.
+4. Set `LEAD_ROUTING_META_ADS_ENABLED=true` and verify with a real (or
+   dry-run) send before trusting it in production again.
+
+No test changes were needed - none of `tests/test_campaign_worker.py`'s
+tests mock or assert on `notify_lead_routing_best_effort`, and this
+change is strictly more conservative (skips a call that was previously
+attempted unconditionally) than what was there before.
+
+### UPDATE (2026-08-12, same day) - this is now the PERMANENT architecture, not a stopgap
+
+Original framing above ("re-enable once configuration/budget are
+captured") assumed the fix was: teach Phase 2 to collect that data and
+call Phase 3 itself. Explicit product decision instead: **Phase 2 must
+never call Phase 3 directly, for any lead, ever.** The only legitimate
+trigger for a salesperson notification is `Indihomes-chatbot-V1`'s
+`/search` endpoint - the moment an actual shortlist of properties is
+shown to a lead, whoever originated them (organic Phase 1 conversation
+OR a Meta Ads lead who tapped through into the qualification flow).
+
+**Why this is the right trigger point, not just a workaround:** `/search`
+is the one place in the whole system where real `configuration` and
+`budget` are actually known - collected conversationally, question by
+question, before the shortlist is ever shown. Nothing earlier in either
+pipeline (Phase 2's CRM poll, this repo's own `Lead` model, the initial
+template send) has that data or ever will, because it isn't collected
+that early. Trying to teach Phase 2 to send Phase 3 notifications with
+placeholder/incomplete data was always going to be worse than not
+sending at all - the right fix isn't better data collection in Phase 2,
+it's simply never triggering from Phase 2.
+
+**Confirmed no other Phase 2 call site exists:** `routes/campaign.py`
+(`/property-detail`, `/notify-advisor`, `/interpret-message`) never
+references `notify_lead_routing_best_effort` or Phase 3 at all -
+`process_lead()`'s now-disabled call (see above) was the only one in
+this entire repo. `process_generic_lead()` never had one either. So the
+2026-08-12 fix above is sufficient on its own - no further code change
+needed for this decision; it was already structurally correct, just
+documented as temporary when it's actually permanent.
+
+**The one dependency this relies on that lives OUTSIDE this codebase:**
+WATI's own flow-builder configuration must actually route a Meta Ads
+lead's "Interested" tap into Phase 1's full qualification flow (area →
+budget → configuration → `/search`), not just show one property's
+detail and stop. If that routing isn't wired in WATI's dashboard, a
+Meta Ads lead may never reach `/search` at all - meaning they'd never
+get a salesperson notification, not just a delayed one. That's a WATI
+flow-config question, not something visible in or fixable from this
+repo's code - worth confirming directly in the WATI Flow Builder if
+"Meta Ads leads never seem to trigger a salesperson notification even
+after continuing the conversation" ever comes up as a report.
+
+`config.py`'s `lead_routing_meta_ads_enabled` flag is kept as-is (still
+defaults `false`) - not because re-enabling is expected, but because
+removing it entirely would remove the one clean escape hatch if this
+architectural decision is ever revisited. Its docstring there should be
+read alongside this update, not instead of it.

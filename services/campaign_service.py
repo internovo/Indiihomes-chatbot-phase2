@@ -185,7 +185,25 @@ async def process_lead(
     # notify_lead_routing_best_effort() - same non-negotiable rule as
     # _update_crm_status_after_send below: nothing here may ever
     # re-trigger a resend of the CUSTOMER'S template.
-    await notify_lead_routing_best_effort(lead, prop)
+    #
+    # DISABLED as of 2026-08-12 - see config.py's lead_routing_meta_ads_
+    # enabled docstring and claude.md, "Meta Ads salesperson notification
+    # disabled", for the full story. Short version: this repo's Lead
+    # model (models/lead.py) never captured configuration/budget from the
+    # CRM at all, so every real Meta Ads salesperson notification sent so
+    # far went out with "Looking For: -" and "Budget: -" - confirmed from
+    # actual production WhatsApp messages. Re-enable via
+    # LEAD_ROUTING_META_ADS_ENABLED=true only once that data is actually
+    # captured and forwarded correctly.
+    settings = get_settings()
+    if settings.lead_routing_meta_ads_enabled:
+        await notify_lead_routing_best_effort(lead, prop)
+    else:
+        logger.info(
+            "Phase 3 salesperson notification skipped for lead %s (Meta Ads routing "
+            "disabled pending configuration/budget field fix - see claude.md)",
+            lead.id,
+        )
 
     await _update_crm_status_after_send(indihomes_client, lead)
     return record

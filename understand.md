@@ -583,15 +583,40 @@ retry just the notification — without ever risking a second customer
 message, since that branch never reaches `wati_client.send_template`
 at all.
 
-**Also currently a safe no-op in production** for the same reason as
-Phase 1's copy of this hook: `LEAD_ROUTING_URL` in this repo's `.env`
-is still a localhost placeholder, because the routing service hasn't
-been deployed anywhere yet. See
-`../indihomes-lead-routing-service/understand.md` for the full design
-of what happens on the other end of this call, and its `claude.md` for
-the concrete blockers (deployment, a real Cosmos key, unverified
-salesperson field names) still standing between this hook being wired
-and it actually notifying anyone.
+**UPDATE (2026-08-12) - this hook is now LIVE, but with a carve-out:**
+Phase 3 was deployed to Azure and `WATI_DRY_RUN` flipped off in
+production. Real salesperson notifications went out for Property
+Campaign leads - but the very first ones surfaced a real data gap:
+Meta Ads leads' notifications arrived with `Looking For: -` and
+`Budget: -`, because this repo's `Lead` model (`models/lead.py`) never
+captured `configuration`/`budget` from the CRM in the first place -
+`_build_payload()` in `integrations/lead_routing_client.py` had nothing
+to forward. A notification missing the two fields most relevant to
+actually following up reads as broken software, not "no data yet" -
+worse than sending nothing.
+
+**So `notify_lead_routing_best_effort()` is deliberately DISABLED for
+Meta Ads as of 2026-08-12**, via a new settings flag
+(`lead_routing_meta_ads_enabled`, env var
+`LEAD_ROUTING_META_ADS_ENABLED`, defaults `false`), gated right at the
+call site in `process_lead()`:
+
+```python
+settings = get_settings()
+if settings.lead_routing_meta_ads_enabled:
+    await notify_lead_routing_best_effort(lead, prop)
+else:
+    logger.info("Phase 3 salesperson notification skipped for lead %s (...)", lead.id)
+```
+
+See `claude.md`, "Meta Ads salesperson notification disabled", for the
+full incident writeup and the exact steps to re-enable once
+configuration/budget are actually captured from the CRM. Note this is
+a **Phase 2-only** limitation - `Indihomes-chatbot-V1`'s own copy of
+this hook (fired from `/search` and `/save-lead`) is unaffected and
+still live, since direct-website leads genuinely do have real
+configuration/budget data collected conversationally before Phase 3 is
+ever called.
 
 Updated picture of §12's diagram, with Phase 3 added:
 
