@@ -12,7 +12,7 @@ from integrations.wati_client import get_wati_client
 from business_hours import IST_NAME
 from routes import campaign, health, webhook
 from utils.logger import get_logger
-from workers import campaign_worker, cleanup_worker, queue_flush_worker, retry_worker
+from workers import campaign_worker, cleanup_worker, meta_resend_worker, queue_flush_worker, retry_worker
 
 logger = get_logger("app")
 scheduler = AsyncIOScheduler()
@@ -46,6 +46,13 @@ async def _run_queue_flush_cycle():
         logger.exception("queue_flush_worker cycle raised an unhandled error")
 
 
+async def _run_meta_resend_cycle():
+    try:
+        await meta_resend_worker.run_cycle(get_indihomes_client(), get_wati_client())
+    except Exception:  # noqa: BLE001 - one bad resend run must never kill the scheduler
+        logger.exception("meta_resend_worker cycle raised an unhandled error")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -61,6 +68,16 @@ async def lifespan(app: FastAPI):
         _run_queue_flush_cycle, "cron",
         hour=settings.queue_flush_hour_ist, minute=settings.queue_flush_minute_ist,
         timezone=IST_NAME, id="queue_flush_worker",
+    )
+    # Meta-restricted resend (see utils/meta_delivery_store.py,
+    # routes/webhook.py, workers/meta_resend_worker.py) - resends leads
+    # Meta marked UNDELIVERED the previous day, once, at 10 AM IST.
+    # Same "cron" reasoning as queue_flush_worker above: must fire at a
+    # specific wall-clock time in IST, not N seconds after process start.
+    scheduler.add_job(
+        _run_meta_resend_cycle, "cron",
+        hour=settings.meta_resend_hour_ist, minute=settings.meta_resend_minute_ist,
+        timezone=IST_NAME, id="meta_resend_worker",
     )
     scheduler.start()
     logger.info("Phase 2 Campaign Service started (env=%s)", settings.environment)

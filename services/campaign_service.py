@@ -46,7 +46,7 @@ from models.campaign import CampaignRecord
 from models.lead import Lead
 from models.notify import NotifyAdvisorRequest
 from services import campaign_context, notify_service, property_service, template_service
-from utils import lead_send_lock, opted_out_store, pending_queue, sent_template_store
+from utils import lead_send_lock, meta_delivery_store, opted_out_store, pending_queue, sent_template_store
 from utils.constants import CampaignStatus
 from utils.logger import get_logger
 
@@ -163,6 +163,13 @@ async def process_lead(
             else:
                 await wati_client.send_template(payload["phone"], payload["template_name"], payload["parameters"])
                 sent_template_store.mark_sent(lead.id, payload["template_name"])
+                # Tracks delivery status via routes/webhook.py's WATI status
+                # callbacks (delivered/failed) - see utils/meta_delivery_store.py's
+                # module docstring. This is a SEPARATE concept from sent_template_store
+                # above: that one means "WATI accepted the send"; this one means
+                # "did it actually reach the customer", which is what the 10 AM
+                # Meta-restricted resend (workers/meta_resend_worker.py) keys off.
+                meta_delivery_store.record_sent(lead, payload["template_name"], category="property_campaign")
                 record.mark_sent()
                 logger.info("Campaign template sent to lead %s for project %s", lead.id, prop.project_name)
 
@@ -258,6 +265,8 @@ async def process_generic_lead(
             else:
                 await wati_client.send_template(lead.phone, template_name, parameters)
                 sent_template_store.mark_sent(lead.id, template_name)
+                # See the matching comment in process_lead above.
+                meta_delivery_store.record_sent(lead, template_name, category="generic_interest")
                 record.mark_sent()
                 logger.info("Generic-interest template sent to lead %s (source=%r)", lead.id, lead.lead_source)
 

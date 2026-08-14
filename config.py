@@ -51,6 +51,19 @@ class Settings(BaseSettings):
     queue_flush_hour_ist: int = 10
     queue_flush_minute_ist: int = 0
 
+    # --- Meta-restricted resend (see utils/meta_delivery_store.py,
+    # routes/webhook.py, workers/meta_resend_worker.py) ---
+    # When the daily resend for templates Meta marked UNDELIVERED runs.
+    # Confirmed with the business as 10:00 AM IST - deliberately the SAME
+    # clock time as queue_flush_hour_ist above (not a coincidence: this
+    # worker does its own send, not a gated one, so it doesn't hit the
+    # is_business_hours() 9-vs-10-AM trap that constrains queue_flush_worker,
+    # but keeping both jobs at business-open is what the business actually
+    # asked for). Configurable here rather than hardcoded, same convention
+    # as every other worker interval in this file.
+    meta_resend_hour_ist: int = 10
+    meta_resend_minute_ist: int = 0
+
     # --- Advisor email notifications (POST /notify-advisor) ---
     # Brevo's HTTPS API only - see integrations/email_client.py for why
     # (works identically locally and on Railway; SMTP does not).
