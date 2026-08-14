@@ -16,10 +16,22 @@ class Settings(BaseSettings):
     wati_api_key: str = ""
     wati_endpoint: str = "https://live-mt-server.wati.io"
     # Property Campaign leads (Housing.com / website form) - references a specific project.
+    # TEMPORARY REVERT (see claude.md, "Utility template rollout - round 2"):
+    # housing_template (Utility, Approved) has no quick-reply button, so a
+    # lead tapping "interested" has nothing to auto-trigger the qualification
+    # flow with. Reverted to the original Marketing template - which DOES
+    # have its button already wired - until a new buttoned Utility template
+    # is built, submitted, and approved. Swap back once that's live.
     wati_template_name: str = "campaign_property_intro"
     # Generic Interest leads (Meta Ads / EOI) - no project data, just a
     # "thanks for your interest" opener that hands off into Phase 1's
     # qualification flow once the lead taps in.
+    # TEMPORARY REVERT - meta_flow and meta_flow2 both got reclassified to
+    # Marketing by Meta anyway, and meta_flow2 has since been DELETED in
+    # WATI - leaving this pointed at meta_flow2 would make every Generic
+    # Interest send fail outright (template not found). Reverted to the
+    # original Marketing template until a new buttoned Utility template is
+    # built, submitted, and approved.
     wati_generic_template_name: str = "campaign_generic_intro"
 
     # --- Worker tuning ---
