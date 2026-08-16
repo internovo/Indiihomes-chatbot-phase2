@@ -63,6 +63,25 @@ class WatiClient:
             return resp.json()
 
     @with_retry(attempts=2)
+    async def update_contact_attributes(self, phone: str, attributes: dict) -> dict:
+        """Sets custom contact attributes in WATI (e.g. last_campaign_template)
+        so downstream Automation Rules can filter on them - see
+        claude.md, "24h follow-up wiring". WATI's updateContactAttributes
+        endpoint takes a customParams array, one {name, value} pair per
+        attribute - the attribute itself must already exist as a defined
+        Custom Attribute in WATI (Team Inbox -> any chat -> contact panel
+        -> Edit -> +ADD NEW) before this call will have anywhere to write
+        the value; it does not create new attribute definitions on the fly.
+        """
+        async with await self._client() as client:
+            resp = await client.post(
+                f"/api/v1/updateContactAttributes/{phone}",
+                json={"customParams": [{"name": k, "value": v} for k, v in attributes.items()]},
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    @with_retry(attempts=2)
     async def assign_chat(self, phone: str, operator_email: str) -> dict:
         async with await self._client() as client:
             resp = await client.post(

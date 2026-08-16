@@ -170,6 +170,22 @@ async def process_lead(
                 # "did it actually reach the customer", which is what the 10 AM
                 # Meta-restricted resend (workers/meta_resend_worker.py) keys off.
                 meta_delivery_store.record_sent(lead, payload["template_name"], category="property_campaign")
+                # Writes last_campaign_template onto the WATI contact so the
+                # 24h follow-up Automation Rules (housing side) can filter on
+                # it - see claude.md, "24h follow-up wiring". Best-effort and
+                # deliberately outside the lock/critical section's error
+                # handling: if this fails, the customer's message has ALREADY
+                # sent successfully - a WATI-side attribute write failing must
+                # never be treated as the send itself failing.
+                try:
+                    await wati_client.update_contact_attributes(
+                        lead.phone, {"last_campaign_template": payload["template_name"]}
+                    )
+                except Exception as exc:  # noqa: BLE001 - never let this affect the send outcome above
+                    logger.warning(
+                        "Sent template to lead %s but failed to write last_campaign_template attribute: %s",
+                        lead.id, exc,
+                    )
                 record.mark_sent()
                 logger.info("Campaign template sent to lead %s for project %s", lead.id, prop.project_name)
 
@@ -267,6 +283,16 @@ async def process_generic_lead(
                 sent_template_store.mark_sent(lead.id, template_name)
                 # See the matching comment in process_lead above.
                 meta_delivery_store.record_sent(lead, template_name, category="generic_interest")
+                # See the matching comment + reasoning in process_lead above.
+                try:
+                    await wati_client.update_contact_attributes(
+                        lead.phone, {"last_campaign_template": template_name}
+                    )
+                except Exception as exc:  # noqa: BLE001 - never let this affect the send outcome above
+                    logger.warning(
+                        "Sent template to lead %s but failed to write last_campaign_template attribute: %s",
+                        lead.id, exc,
+                    )
                 record.mark_sent()
                 logger.info("Generic-interest template sent to lead %s (source=%r)", lead.id, lead.lead_source)
 

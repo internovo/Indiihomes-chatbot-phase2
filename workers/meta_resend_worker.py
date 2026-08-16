@@ -59,6 +59,13 @@ async def _resend_generic(entry: dict, wati_client: WatiClient) -> bool:
 async def run_cycle(indihomes_client: IndihomesClient, wati_client: WatiClient) -> None:
     failed_entries = meta_delivery_store.load_failed()
     if not failed_entries:
+        # Explicit heartbeat, not silence - previously this function
+        # returned with NO log line at all when there was nothing to do,
+        # which made "the cron job didn't fire" and "it fired and found
+        # nothing" indistinguishable in the logs. Added after exactly
+        # that ambiguity came up while verifying this worker for real
+        # against production leads on 16 Aug 2026.
+        logger.info("10 AM IST Meta-restricted resend: cycle ran, 0 leads currently marked undelivered.")
         return
 
     logger.info("10 AM IST Meta-restricted resend: %d lead(s) marked undelivered yesterday", len(failed_entries))
