@@ -645,3 +645,33 @@ Updated picture of §12's diagram, with Phase 3 added:
  │  area → budget → BHK → search → book → save-lead  │      from /save-lead)
  └──────────────────────────────────────────────────┘
 ```
+
+## 14. A second, sibling hook: lead-events, feeding indihomes-os's Lead Capture UI
+
+Separate from the Phase 3 diagram above (which notifies a *salesperson*),
+a later addition feeds the *internal CRM's* "AI Activity" tick and "Lead
+Journey" tracker — so a human looking at ANY lead in indihomes-os (not
+just ones that reach Phase 1's qualification flow) can see whether the
+opening WhatsApp template actually reached them.
+
+```
+services/campaign_service.py (template_sent)
+routes/webhook.py (delivered / failed)
+workers/meta_resend_worker.py (resent)
+        │
+        └──► integrations/os_events_client.emit_best_effort()
+                     │
+                     ▼
+        indihomes-os's POST /api/lead-events
+```
+
+The interesting part isn't the happy path — it's that this repo already
+had to solve "how do I know which lead a DELIVERED/FAILED webhook is
+about" for `utils/meta_delivery_store.py`'s own purposes (see that
+module's docstring: those two WATI event types carry no phone at all,
+only a `whatsappMessageId`). The lead-events hook reuses that exact
+solution rather than re-deriving it — see `claude.md`'s "Lead events"
+task section for the small, additive `get_record_by_message_id()` helper
+that made the phone recoverable for this new purpose, and for a second,
+unrelated trap it also caught in indihomes-os's own checkpoint vocabulary
+before it could silently drop events.

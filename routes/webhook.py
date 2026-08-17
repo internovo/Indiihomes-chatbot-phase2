@@ -43,6 +43,7 @@ route's URL -> Enabled -> at minimum "Template Message Sent",
 """
 from fastapi import APIRouter, Request
 
+from integrations.os_events_client import emit_best_effort as emit_os_event
 from utils import meta_delivery_store
 from utils.logger import get_logger
 
@@ -111,6 +112,15 @@ async def wati_webhook(request: Request):
     elif event_type in _DELIVERED_EVENTS:
         if message_id:
             meta_delivery_store.mark_delivered_by_message_id(message_id)
+            # Lead-events: the DELIVERED/FAILED payloads carry NO phone (see
+            # module docstring) - recover it from the record
+            # mark_delivered_by_message_id just updated, via the additive
+            # get_record_by_message_id() lookup (see meta_delivery_store.py).
+            record = meta_delivery_store.get_record_by_message_id(message_id)
+            if record and record.get("phone"):
+                await emit_os_event(record["phone"], "delivered", {
+                    "template_name": record.get("template_name"),
+                }, idempotency_key=f"delivered:{message_id}")
         else:
             logger.warning("Delivered-type webhook (event=%s) had no whatsappMessageId - can't correlate.", event_type)
 
@@ -119,6 +129,12 @@ async def wati_webhook(request: Request):
         failed_detail = str(payload.get("failedDetail") or "")
         if message_id:
             meta_delivery_store.mark_failed_by_message_id(message_id, failed_code, failed_detail)
+            record = meta_delivery_store.get_record_by_message_id(message_id)
+            if record and record.get("phone"):
+                await emit_os_event(record["phone"], "failed", {
+                    "template_name": record.get("template_name"),
+                    "failed_code": failed_code, "failed_detail": failed_detail,
+                }, idempotency_key=f"failed:{message_id}")
         else:
             logger.warning("Failed-type webhook (event=%s) had no whatsappMessageId - can't correlate.", event_type)
 

@@ -879,3 +879,102 @@ defaults `false`) - not because re-enabling is expected, but because
 removing it entirely would remove the one clean escape hatch if this
 architectural decision is ever revisited. Its docstring there should be
 read alongside this update, not instead of it.
+
+---
+
+# TASK: Lead events - feeding indihomes-os's Lead Capture UI
+
+## What this is
+
+The sibling of Indihomes-chatbot-V1's own "Lead events" task (see that
+repo's `claude.md`) - indihomes-os's Lead Capture screen shows an "AI
+Activity" tick (did the WhatsApp template actually reach this lead?) and
+a vertical "Lead Journey" checkpoint tracker, for EVERY lead regardless of
+which pipeline captured them. This repo's job is to feed real WhatsApp
+delivery-status events for leads run through the Phase 2 campaign
+pipeline (Property Campaign / Generic Interest).
+
+## What was built
+
+### `integrations/os_events_client.py` (new)
+
+Same async httpx / `with_retry` / lazy-singleton shape as
+`integrations/lead_routing_client.py` in this same folder - read that file
+first if anything here looks unfamiliar. One function,
+`emit_best_effort(phone, checkpoint, payload=None, source_ref="",
+idempotency_key="")`, posting to indihomes-os's `POST /api/lead-events`.
+Dry-run defaults `True` (`OS_EVENTS_DRY_RUN`, same convention as
+`LEAD_ROUTING_DRY_RUN`) and blank `OS_EVENTS_URL` is a silent no-op - same
+safety posture as the Phase 3 lead-routing hook.
+
+### Four checkpoints wired at their natural, ALREADY-EXISTING decision points
+
+This repo already tracks WhatsApp delivery status in real detail
+(`utils/meta_delivery_store.py` - PENDING/DELIVERED/FAILED/RESENT). The
+lead-events hook does NOT duplicate that tracking; it just emits
+alongside it, at the exact point each state is already decided:
+
+| Checkpoint | Where | Notes |
+|---|---|---|
+| `template_sent` | `services/campaign_service.py`, both `process_lead()` and `process_generic_lead()`, right after `meta_delivery_store.record_sent()` | Fires the moment a real send to the customer succeeds. |
+| `delivered` | `routes/webhook.py`, on `sentMessageDELIVERED`/`sentMessageREAD` | See "a real trap caught" below for why this needed a new lookup helper. |
+| `failed` | `routes/webhook.py`, on `templateMessageFailed` | Same lookup helper; payload carries `failed_code`/`failed_detail`. |
+| `resent` | `workers/meta_resend_worker.py`, only on a successful 10 AM IST resend | Not fired on a resend attempt that itself failed - the `failed` checkpoint from the ORIGINAL send already told indihomes-os what it needs to know. |
+
+### A real trap caught while wiring `delivered`/`failed`: the webhook payloads have no phone
+
+`routes/webhook.py`'s own module docstring already documents this (a
+real production finding from 16 Aug 2026): `sentMessageDELIVERED` and
+`templateMessageFailed` webhooks carry **no phone number at all**, only
+`whatsappMessageId`. `mark_delivered_by_message_id()` /
+`mark_failed_by_message_id()` already knew how to resolve the record
+internally, but returned only a `bool` - not enough for the lead-events
+hook, which needs the actual phone to emit to indihomes-os.
+
+**The fix**: a new, purely additive `get_record_by_message_id()` in
+`utils/meta_delivery_store.py`, called right after the existing
+`mark_*_by_message_id()` calls (which still run exactly as before, still
+return `bool`, untouched) - the new function just re-looks-up the same
+record to read its `phone` field back out. No existing function's
+signature or contract changed.
+
+### A second real trap, caught during THIS wiring, in the OTHER repo
+
+indihomes-os's `lead-journey.cjs` defines the exact checkpoint vocabulary
+`lead-events.cjs` will accept - and it did not originally include
+`delivered`, `failed`, or `resent` at all (only the checkpoints
+Indihomes-chatbot-V1 emits). Emitting them as written would have been
+silently REJECTED by indihomes-os's own validation the moment that
+backend is restored and wired up. Caught before it could ship silently -
+see `indihomes-os-restructured/backend/LEAD_EVENTS_INTEGRATION.md`'s own
+"Update" section for the fix (all three checkpoints added to the ladder,
+plus a related dead-code bug fixed in `db.cjs`'s `getAiActivity()` at the
+same time), and see that same file for the end-to-end re-verification
+that was run afterward.
+
+## Required env vars (see `.env.example`, already updated)
+
+```
+OS_EVENTS_URL=
+OS_EVENTS_SHARED_SECRET=
+OS_EVENTS_DRY_RUN=true
+OS_EVENTS_TIMEOUT_SECONDS=10
+```
+
+## Known limitations
+
+- **Not tested against a live indihomes-os** - same reason as
+  Indihomes-chatbot-V1's own equivalent limitation: that backend doesn't
+  exist yet. `os_events_client.py` itself follows the exact same,
+  already-proven pattern as `lead_routing_client.py` in this file, which
+  IS exercised in this repo's own test suite for the analogous Phase 3
+  hook - the new client was reviewed against that pattern rather than
+  independently sandbox-tested end-to-end (unlike Indihomes-chatbot-V1's
+  copy, which was, since that repo had a convenient throwaway HTTP server
+  test already built for the Phase 3 hook it mirrors).
+- **`lead_replied`/`no_reply`/`followup_sent`-equivalent checkpoints are
+  NOT emitted from this repo** - Phase 2 is a one-shot campaign sender,
+  not a conversation tracker; once a lead taps into Phase 1's
+  qualification flow (see this repo's own architecture diagrams), THAT
+  repo's `followup_scheduler.py` already owns the equivalent signal. No
+  duplicate/competing tracking was added here.

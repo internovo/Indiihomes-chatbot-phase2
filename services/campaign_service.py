@@ -39,6 +39,7 @@ contacted), but the record stays TEMPLATE_SENT and is never retried.
 """
 from integrations.indihomes_client import IndihomesClient
 from integrations.lead_routing_client import notify_lead_routing_best_effort
+from integrations.os_events_client import emit_best_effort as emit_os_event
 from integrations.wati_client import WatiClient
 from business_hours import is_business_hours
 from config import get_settings
@@ -170,6 +171,14 @@ async def process_lead(
                 # "did it actually reach the customer", which is what the 10 AM
                 # Meta-restricted resend (workers/meta_resend_worker.py) keys off.
                 meta_delivery_store.record_sent(lead, payload["template_name"], category="property_campaign")
+                # Lead-events: template_sent checkpoint for indihomes-os's Lead
+                # Capture screen - fired right alongside the existing delivery-
+                # status tracking above, since this is the exact moment a real
+                # send to the customer succeeded. Never raises (see
+                # integrations/os_events_client.py).
+                await emit_os_event(lead.phone, "template_sent", {
+                    "template_name": payload["template_name"], "project_code": prop.project_code,
+                }, idempotency_key=f"{lead.id}:template_sent:{payload['template_name']}")
                 # Writes last_campaign_template onto the WATI contact so the
                 # 24h follow-up Automation Rules (housing side) can filter on
                 # it - see claude.md, "24h follow-up wiring". Best-effort and
@@ -283,6 +292,12 @@ async def process_generic_lead(
                 sent_template_store.mark_sent(lead.id, template_name)
                 # See the matching comment in process_lead above.
                 meta_delivery_store.record_sent(lead, template_name, category="generic_interest")
+                # Lead-events: same template_sent checkpoint as process_lead
+                # above - Generic Interest leads have no project_code to
+                # attach, so payload is just the template name.
+                await emit_os_event(lead.phone, "template_sent", {
+                    "template_name": template_name,
+                }, idempotency_key=f"{lead.id}:template_sent:{template_name}")
                 # See the matching comment + reasoning in process_lead above.
                 try:
                     await wati_client.update_contact_attributes(

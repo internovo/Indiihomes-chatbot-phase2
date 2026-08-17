@@ -297,3 +297,26 @@ def get_current_status(lead_id: str, template_name: str) -> Optional[str]:
     data = _read_raw()
     record = data.get("records", {}).get(_key(lead_id, template_name))
     return record.get("status") if record else None
+
+
+def get_record_by_message_id(whatsapp_message_id: str) -> Optional[dict]:
+    """Additive read-only helper - NOT part of the mark_delivered/mark_failed
+    contract, which intentionally still just returns bool (changing that
+    return type would ripple into routes/webhook.py's existing call sites
+    and any tests asserting on it).
+
+    Added for integrations/os_events_client.py's lead-events hook: unlike
+    templateMessageSent, the DELIVERED/FAILED webhook payloads carry NO
+    phone number at all (see this module's own correlation-key note above)
+    - so after routes/webhook.py calls mark_delivered_by_message_id() /
+    mark_failed_by_message_id(), it needs a SEPARATE lookup to recover the
+    phone for the lead-events emit() call. Returns the full record dict
+    (including "phone", "lead", "template_name") or None if not found.
+    """
+    if not whatsapp_message_id:
+        return None
+    data = _read_raw()
+    for record in data.get("records", {}).values():
+        if record.get("whatsapp_message_id") == whatsapp_message_id:
+            return record
+    return None

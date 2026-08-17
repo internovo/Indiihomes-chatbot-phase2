@@ -22,6 +22,7 @@ building services (template_service / formatter) so the resent message
 is byte-for-byte the same template call as the original.
 """
 from integrations.indihomes_client import IndihomesClient
+from integrations.os_events_client import emit_best_effort as emit_os_event
 from integrations.wati_client import WatiClient
 from services import property_service, template_service
 from utils import lead_send_lock, meta_delivery_store
@@ -110,6 +111,16 @@ async def run_cycle(indihomes_client: IndihomesClient, wati_client: WatiClient) 
             if sent_ok:
                 resent += 1
                 logger.info("Resent template %s to lead %s at 10 AM IST (previously undelivered)", template_name, lead_id)
+                # Lead-events: only fired on an actual successful resend -
+                # a resend attempt that itself failed has nothing new to
+                # tell indihomes-os beyond the 'failed' checkpoint already
+                # emitted by routes/webhook.py when the ORIGINAL send failed.
+                try:
+                    await emit_os_event(entry.get("phone", ""), "resent", {
+                        "template_name": template_name,
+                    }, idempotency_key=f"{lead_id}:resent:{template_name}")
+                except Exception as exc:  # noqa: BLE001 - must never affect the resend outcome above
+                    logger.error("os_events_client resent emit failed for lead %s: %s", lead_id, exc)
 
     logger.info(
         "10 AM Meta-restricted resend complete: %d resent, %d skipped (delivered before resend ran), %d errors",

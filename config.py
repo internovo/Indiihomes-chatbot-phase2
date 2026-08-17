@@ -114,6 +114,18 @@ class Settings(BaseSettings):
     # pydantic-settings maps snake_case field -> SCREAMING_SNAKE env var).
     lead_routing_meta_ads_enabled: bool = False
 
+    # --- Lead events (see integrations/os_events_client.py) ---
+    # Pushes WhatsApp checkpoint events (template_sent, delivered, failed,
+    # resent) to indihomes-os's Lead Capture screen. Blank os_events_url =
+    # silent no-op, same convention as lead_routing_url above. Dry-run
+    # defaults True for the same reason: this repo's own server.cjs
+    # target (indihomes-os) doesn't exist yet as of this writing - see
+    # integrations/os_events_client.py's module docstring.
+    os_events_url: str = ""
+    os_events_shared_secret: str = ""
+    os_events_dry_run: bool = True
+    os_events_timeout_seconds: int = 10
+
     # --- Misc ---
     log_level: str = "INFO"
     environment: str = "development"
