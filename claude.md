@@ -1166,3 +1166,92 @@ GET /debug/pipeline   -> watch the next few leads' real outcomes
 ```
 The next Mahindra Marina / 38 Avenue / Treesourus lead should show
 `template_sent` instead of vanishing into a retry loop.
+
+---
+
+# RESOLVED: the "STILL OPEN" item above was an expired WATI access token
+
+The section above ended with ~11 leads for exactly-matching projects
+(Ruparel Stardom, Chaitanya Ethics Orovia, Asmi Legacy, AnchorPoint
+Aviara) that landed inside business hours between 28 Aug and 2 Sep and
+sent nothing, with the logs for that window already rolled off. This is
+what it was.
+
+## How it was pinned down without logs
+
+`campaign_context.remember(lead.phone, prop.project_code)` runs AFTER
+property resolution succeeds and BEFORE the WATI send, and it is
+persisted to `state/campaign_context.json` and never pruned. That makes
+it an accidental but perfect forensic marker for how far a lead got.
+`GET /debug/context/{phone}` on the live service, for four leads whose
+advisor-abandonment emails were in the Zoho inbox:
+
+| Lead | Project | `project_code` | Conclusion |
+|---|---|---|---|
+| habib patel, 1 Sep | Ruparel Stardom | `INV_MW_402` | resolved, died at the SEND |
+| Ragunath Shirke, 2 Sep | Chaitanya Ethics Orovia | `INV_MW_441` | resolved, died at the SEND |
+| Bhausaheb Gaikwad, 2 Sep | Mahindra Marina 64 Phase 3 | `null` | never resolved (the naming bug) |
+| Muna Lal, 3 Sep | 38 Avenue | `null` | never resolved (the naming bug) |
+
+Two independent bugs, cleanly separated by one endpoint that already
+existed. Worth remembering as a technique: a persisted side effect
+written between two pipeline stages tells you which stage failed, long
+after the logs are gone.
+
+## Root cause
+
+The WATI access token expired around 28 Aug 2026. WATI tokens are JWTs
+with a hard expiry. Confirmed by calling a read-only WATI endpoint with
+the stored key:
+
+```powershell
+Invoke-WebRequest "$ep/api/v1/getMessageTemplates?pageSize=1" -Headers @{Authorization="Bearer $key"}
+# -> 401 Unauthorized   (200 OK after rotating the token)
+```
+
+**Fix: rotate the token** (WATI -> Settings -> API & Webhooks -> Access
+Token) and update `WATI_API_KEY` in Railway's variables AND the local
+`.env`. No code change fixes this one.
+
+## Why it stayed invisible for five days - and what now makes it loud
+
+A 401 is categorically different from a timeout: it is account-wide, it
+affects every send, and it cannot clear on its own. Nothing in the
+pipeline knew that. `with_retry` retried 3x, `campaign_service` marked
+the lead RETRYING, `retry_worker` retried 3 more times over ~80 minutes,
+then abandoned it and emailed an advisor - per lead, for five days,
+while `/health` said `"status": "ok"` and no worker ever crashed.
+
+The advisor emails were the ONLY outward signal, and they were
+indistinguishable from the naming bug's own abandonments.
+
+`integrations/wati_client.py` now:
+- logs at **ERROR** on a 401/403 from `sendTemplateMessage`, naming the
+  cause and the exact fix, and
+- records it in `_auth_state`, surfaced as **`wati_auth`** on `/health`
+  and `/debug/pipeline`: `ok` / `REJECTED` / `unknown` (nothing sent
+  since restart).
+
+**Deliberately NOT changed - the retry behaviour itself.** Short-
+circuiting sends on a remembered auth failure would risk one bad
+response wedging a working key. The wasted retries were never the
+problem; nobody knowing was.
+
+## Backlog, not yet done
+
+Roughly 25 leads from 29 Aug - 3 Sep were abandoned and never messaged.
+They will NOT come back on their own: `retry_worker`'s queue is
+in-memory and gone, and the checkpoint has advanced past their
+`leadDate`. Recovering them needs `scripts/reprocess_lead.py --lead-id
+<id> --after <ts> --confirm`, one lead at a time (that script's own
+docstring covers its `--test-phone` dry path and its known
+campaign_context limitation). Whether to message a 5-day-old lead at all
+is a business call, not a technical one.
+
+## Testing
+
+`tests/test_wati_auth_health.py` (new, 7 tests): unknown before any
+send, `ok` after a 200, `REJECTED` + an ERROR log naming the cause on
+401 and on 403, a 500 explicitly NOT reported as an auth problem (so
+nobody chases a token that is fine), and both `/health` and
+`/debug/pipeline` carrying the field. 124 tests passing overall.

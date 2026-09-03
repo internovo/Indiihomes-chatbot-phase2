@@ -15,7 +15,7 @@ from fastapi import APIRouter
 
 from business_hours import is_business_hours
 from config import get_settings
-from integrations import lead_routing_client
+from integrations import lead_routing_client, wati_client
 from utils import checkpoint, pending_queue, sent_template_store
 from workers import campaign_worker, retry_worker
 
@@ -45,6 +45,11 @@ async def health():
         # whatever else looks fine.
         "checkpoint": checkpoint.peek(),
         "templates_sent_total": sent_template_store.sent_count(),
+        # "REJECTED" here means the WATI access token has expired and
+        # every campaign send is failing - see integrations/wati_client.py's
+        # _auth_state comment. "unknown" just means no send has been
+        # attempted since the last restart.
+        "wati_auth": wati_client.auth_status(),
     }
 
 
@@ -63,5 +68,6 @@ async def debug_pipeline():
         "pending_retries": retry_worker.pending_count(),
         "pending_off_hours_queue": pending_queue.pending_count(),
         "templates_sent_total": sent_template_store.sent_count(),
+        "wati_auth": wati_client.auth_status(),
         "recent_outcomes": campaign_worker.recent_outcomes(),
     }

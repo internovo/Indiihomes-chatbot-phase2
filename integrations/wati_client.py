@@ -15,6 +15,8 @@ exist but not be reliably functional. Response shape differs
 {"result", "info", "validWhatsAppNumber"}) but nothing in this codebase
 reads specific fields off the return value, so this is a safe swap.
 """
+from datetime import datetime, timezone
+
 import httpx
 
 from config import get_settings
@@ -22,6 +24,49 @@ from utils.logger import get_logger
 from utils.retry import with_retry
 
 logger = get_logger("wati_client")
+
+# --- Credential health --------------------------------------------------
+#
+# Added 3 Sep 2026, after the incident this whole module's docstring
+# above is a monument to a smaller version of.
+#
+# WATI access tokens are JWTs with a hard expiry. When this one expired
+# (~28 Aug 2026), every sendTemplateMessage returned 401. Nothing in the
+# pipeline treated that differently from a network blip: with_retry
+# retried 3 times, campaign_service marked the lead RETRYING,
+# retry_worker retried 3 more times over ~80 minutes, then abandoned it
+# and emailed an advisor. Repeat, per lead, for five days. /health said
+# "ok" the entire time, no worker crashed, and the only trace was a
+# WARNING line in logs that roll off after ~3 hours.
+#
+# A 401/403 is categorically different from a timeout: it is
+# account-wide, affects EVERY send, and cannot clear on its own - a
+# human has to rotate the token. So it gets recorded here and surfaced
+# on /health, where "the pipeline is healthy but sending nothing" stops
+# being an invisible state.
+#
+# Deliberately NOT changed: the retry behaviour itself. Short-circuiting
+# sends on a remembered auth failure would risk one bad response
+# wedging a working key, and the loud ERROR + /health field already
+# solve the actual problem, which was never the wasted retries - it was
+# nobody knowing.
+_auth_state: dict = {"status": "unknown", "detail": "", "at": None}
+
+
+def _note_auth(ok: bool, detail: str = "") -> None:
+    _auth_state["status"] = "ok" if ok else "REJECTED"
+    _auth_state["detail"] = detail
+    _auth_state["at"] = datetime.now(timezone.utc).isoformat()
+
+
+def auth_status() -> dict:
+    """Whether WATI last accepted or rejected this service's credentials.
+
+    "unknown" until the first send is attempted - a freshly restarted
+    service has not proven anything either way yet. Read by
+    routes/health.py.
+    """
+    return dict(_auth_state)
 
 
 class WatiClient:
@@ -45,7 +90,20 @@ class WatiClient:
                 f"/api/v2/sendTemplateMessage?whatsappNumber={phone}",
                 json={"template_name": template_name, "broadcast_name": template_name, "parameters": parameters},
             )
+            if resp.status_code in (401, 403):
+                # See the _auth_state block comment at the top of this
+                # module. This is the line that would have turned a
+                # five-day silent outage into a five-minute one.
+                _note_auth(False, f"HTTP {resp.status_code} from sendTemplateMessage")
+                logger.error(
+                    "WATI REJECTED THIS SERVICE'S CREDENTIALS (HTTP %s). This is NOT a transient failure - "
+                    "the access token has almost certainly expired, and EVERY campaign send will keep failing "
+                    "until it is rotated (WATI -> Settings -> API & Webhooks -> Access Token, then update "
+                    "WATI_API_KEY in Railway). Check GET /health's wati_auth field.",
+                    resp.status_code,
+                )
             resp.raise_for_status()
+            _note_auth(True)
             return resp.json()
 
     @with_retry(attempts=2)
