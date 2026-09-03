@@ -49,6 +49,13 @@ def has_sent(lead_id: str, template_name: str) -> bool:
     return _key(lead_id, template_name) in sent
 
 
+def sent_count() -> int:
+    """How many (lead_id, template) sends this service has ever recorded.
+    Surfaced on /health so a pipeline that has silently stopped
+    delivering is visible without reading logs - see routes/health.py."""
+    return len(_read_raw().get("sent", {}))
+
+
 def mark_sent(lead_id: str, template_name: str) -> None:
     if not lead_id or not template_name:
         logger.warning("mark_sent called with lead_id=%r template_name=%r - ignoring.", lead_id, template_name)

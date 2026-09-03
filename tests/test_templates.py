@@ -95,20 +95,25 @@ async def test_process_lead_success_path():
 
 
 @pytest.mark.asyncio
-async def test_process_lead_marks_retry_when_property_unresolved():
-    """Has project_code, so this is a genuine "couldn't find this
-    project in the backend" failure (bad code / backend hiccup) - NOT
-    the no-project-data-at-all case, which is covered separately in
-    test_campaign_worker.py and short-circuits to ADVISOR_NOTIFIED
-    instead of RETRYING."""
+async def test_process_lead_notifies_advisor_when_property_unresolved(fake_email_client):
+    """CHANGED 3 Sep 2026 - this used to assert RETRYING.
+
+    resolve_property returns None only when every lookup ANSWERED
+    SUCCESSFULLY and had no match; a transport/HTTP failure raises
+    instead (still RETRYING - see
+    test_process_lead_marks_retry_on_wati_failure below, which keeps
+    that path covered). So None means the project genuinely isn't in
+    the catalogue, which retrying an identical lookup 3 more times over
+    ~80 minutes cannot fix. Straight to a human instead."""
     lead = Lead(_id="1", phone="919876543210", lead_source="Housing.com", projectCode="MISSING")
     indihomes = FakeIndihomesClient(project=None)
     wati = FakeWatiClient()
 
     record = await campaign_service.process_lead(lead, indihomes, wati)
 
-    assert record.status == CampaignStatus.RETRYING
-    assert record.next_retry_at > 0
+    assert record.status == CampaignStatus.ADVISOR_NOTIFIED
+    assert record.attempts == 0
+    assert len(fake_email_client.sent) == 1
 
 
 @pytest.mark.asyncio

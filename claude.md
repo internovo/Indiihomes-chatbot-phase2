@@ -978,3 +978,191 @@ OS_EVENTS_TIMEOUT_SECONDS=10
   qualification flow (see this repo's own architecture diagrams), THAT
   repo's `followup_scheduler.py` already owns the equivalent signal. No
   duplicate/competing tracking was added here.
+
+---
+
+# CHANGELOG: campaign sends went silent for 5 days - project-name resolution + the observability gap that hid it
+
+## The report
+
+"No templates sent since 30 Aug, leads are still arriving in the CRM,
+the backend hasn't crashed." All three parts were true.
+
+## What was verified first (so nobody re-checks these)
+
+Ruled out by direct inspection, not inference:
+
+- **The poller is fine.** 255 poll cycles in a 3-hour log window, all
+  200 OK, checkpoint advancing correctly (`2026-09-02T12:24` ->
+  `09-03T03:28` -> `04:29`).
+- **The CRM API is fine.** `get-new-leads?afterDate=2026-08-25` returns
+  67 real leads. `afterDate` is a strict `>` on `leadDate`, so nothing
+  is double-fetched or skipped by the filter itself.
+- **The service is fine.** `/health` returns ok, `pending_retries: 0`,
+  `pending_off_hours_queue: 0`.
+- **The WATI template is fine.** `campaign_property_intro` is
+  **Approved** in WATI (checked in the dashboard). Not paused by Meta.
+- **Nothing was deployed** in the window.
+
+## Root cause 1 - every Housing.com lead has `projectCode: null`
+
+All 67 leads from 25 Aug - 3 Sep have `projectCode: null` and only a
+`projectName`. So `property_service.resolve_property` depends ENTIRELY
+on that name matching an Indihomes `displayName`, and tiers 1-3 all
+required an EXACT (whitespace-normalized) match.
+
+Housing.com and the Indihomes catalogue name the same building
+differently, in two predictable directions. Measured against the live
+catalogue (153 projects, 3 Sep 2026):
+
+| Lead's `projectName` | Leads | Catalogue `displayName` | Before |
+|---|---|---|---|
+| Ruparel Stardom | 9 | exact | resolved |
+| Chaitanya Ethics Orovia | 9 | exact | resolved |
+| Asmi Legacy | 3 | exact | resolved |
+| AnchorPoint Aviara | 1 | exact | resolved |
+| Mahindra Marina 64 Phase 3 | 7 | `Mahindra Marina` | **FAILED** |
+| 38 Avenue | 4 | `38 Avenue By Artha Lifespaces ` | **FAILED** |
+| Treesourus | 3 | `Chandak Treesourus` | **FAILED** |
+| Narang Vivenda | 11 | (not stocked) | failed, correctly |
+| L And T Ahana Tower A | 8 | (not stocked) | failed, correctly |
+| Sahakar Revanta | 3 | (not stocked) | failed, correctly |
+| Runwal Auris Serenity Tower 4 Residential | 3 | (not stocked) | failed, correctly |
+
+**14 of 61 leads (23%) failed purely on naming.** Tier 3's searchText
+fallback could not save them: it searches on the FIRST WORD only and
+the endpoint does literal substring matching, so a lead named
+"Treesourus" never even sees "Chandak Treesourus" in its candidate
+list, and "L And T Ahana Tower A" searches for the single letter "L"
+and gets most of the catalogue back.
+
+### Fix - tier 4, partial (contained) name match
+
+`property_service.resolve_raw_project` gained a fourth tier that runs
+only when tiers 1-3 all miss. It fetches the FULL catalogue (one
+cached call, 10-minute TTL - the catalogue is ~150 rows and changes
+rarely) and matches on **whole-token contiguous containment in either
+direction**, guarded three ways:
+
+1. Tokens are compared as tokens, so "One Vara" can never match inside
+   "Stone Varanasi".
+2. The shorter side must be at least `_MIN_CONTAINMENT_CHARS` (8)
+   characters, so a short generic name like "Astral" cannot claim a
+   longer name that happens to contain it.
+3. The match must be **unique across the catalogue** - two candidates
+   means resolve nothing rather than guess. This is what keeps
+   "Mahindra Marina 64 Phase 3" off "Mahindra Vista".
+
+Verified against the full live catalogue: **zero** project name matches
+any other project under this rule. The four genuinely-unstocked names
+above still correctly resolve to nothing.
+
+Deliberately NOT done: adding these as manual aliases. The mismatch is
+structural (Housing.com carries builder prefixes and tower/phase
+suffixes that the catalogue doesn't), so it will keep recurring with
+every new project - a rule handles the next one for free, an alias
+table needs a code change each time.
+
+## Root cause 2 - a permanent failure was being retried like a transient one
+
+`process_lead` treated `resolve_property() is None` as
+`mark_failed(...)` -> RETRYING: 3 attempts over ~80 minutes, then
+abandoned, then an advisor email. But None only ever means "every
+lookup answered successfully and had no match" - a transport failure
+RAISES and is caught separately (where retrying genuinely helps). A
+project that isn't in the catalogue at 10:00 isn't in it at 11:20
+either.
+
+Over the same 67 leads that's ~25 leads x 3 pointless lookup rounds,
+and every one of them reached a human over an hour later than it
+needed to.
+
+**Fix:** that branch now notifies an advisor immediately
+(`reason="unresolved_project"`) and returns `ADVISOR_NOTIFIED`. The
+WATI-send failure path is untouched and still retries - covered by
+`test_process_lead_marks_retry_on_wati_failure`, which is why that
+test matters more than it looks.
+
+## Root cause 3 - the reason this took five days to see
+
+The genuine blocker for diagnosis was that **a healthy-looking service
+that sends nothing produces no distinguishing signal**. Every question
+worth asking was only answerable from Railway log history, and
+Railway's log view serves roughly the last 1000 lines - about three
+hours at a 45-second poll. The evidence had rolled off before anyone
+looked.
+
+Three changes so this is a five-minute question next time:
+
+1. **`GET /debug/pipeline`** (new, `routes/health.py`) - the last 50
+   lead outcomes, newest first, with lead_id, project_name, status and
+   last_error, from an in-memory ring buffer in `campaign_worker`.
+   Answers "what actually happened to the recent leads" with no logs
+   at all. Unauthenticated, same trust boundary as the rest of this
+   service, and it exposes phone numbers - put it behind auth before
+   this URL is reachable from anywhere but Railway.
+2. **`/health` gained `checkpoint` and `templates_sent_total`.** A null
+   checkpoint means `state/` didn't persist; a sent-count that stops
+   climbing means the pipeline stopped delivering, whatever else looks
+   green.
+3. **`checkpoint.py` shouts.** A missing checkpoint file now logs at
+   **ERROR**, not INFO - on a service that has run for weeks it means
+   the Railway Volume isn't mounted, and the consequence is silent lead
+   loss (everything older than `initial_lookback_hours` skipped
+   forever, with nothing saying so). And `save_checkpoint` logs
+   `old -> new` at INFO, which is the single most useful line for
+   reconstructing which leads the service actually saw.
+
+## STILL OPEN - what these fixes do NOT explain
+
+Between 28 Aug and 2 Sep, roughly **11 leads for the four
+exactly-matching projects** (Ruparel Stardom x5, Chaitanya Ethics
+Orovia x4, Asmi Legacy, AnchorPoint Aviara) landed INSIDE business
+hours and should have sent regardless of any bug above. They didn't.
+Resolution for those names was verified working live on 3 Sep, so
+whatever stopped them was downstream of resolution or upstream of
+processing, and the logs for that window are gone.
+
+The one clean discriminator, if this needs revisiting: **did advisors
+receive `lead_abandoned` emails for those leads?**
+
+- **Yes** -> the leads WERE processed and failed at the WATI send.
+- **No** -> they were never processed at all, which points at state
+  loss / a checkpoint skip. Change 3 above makes exactly that case
+  loud, and `/debug/pipeline` makes it visible without waiting for a
+  recurrence.
+
+Do not assume the naming fix closed this. It closed 14 leads' worth of
+a real, separate bug.
+
+## Testing
+
+```powershell
+cd C:\Users\admin\Desktop\Indiihomes-chatbot-phase2
+python -m pytest -q
+```
+
+117 passing. `tests/test_partial_project_match.py` (new, 11 tests) uses
+project names copied verbatim from the live catalogue, trailing spaces
+and all - the whitespace inconsistencies are real stored data. It
+covers all three real mismatch shapes, all three guards (token
+boundaries, length floor, ambiguity), the four genuinely-unstocked
+names still failing, exact match short-circuiting before tier 4,
+catalogue caching, and an empty catalogue never being cached.
+
+Two pre-existing tests were UPDATED, not deleted, because root cause 2
+deliberately changed their expected behaviour - both now assert the new
+outcome and say in their docstring what changed and why:
+`test_process_lead_notifies_advisor_when_property_unresolved`
+(test_templates.py, was `..._marks_retry_...`) and
+`test_run_cycle_still_advances_checkpoint_when_a_lead_cannot_be_resolved`
+(test_campaign_worker.py).
+
+## After deploying
+
+```
+GET /health           -> note templates_sent_total, confirm checkpoint is not null
+GET /debug/pipeline   -> watch the next few leads' real outcomes
+```
+The next Mahindra Marina / 38 Avenue / Treesourus lead should show
+`template_sent` instead of vanishing into a retry loop.

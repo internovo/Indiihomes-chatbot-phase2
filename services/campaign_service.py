@@ -115,7 +115,36 @@ async def process_lead(
     try:
         prop = await property_service.resolve_property(indihomes_client, lead)
         if prop is None:
-            record.mark_failed("property not resolved", backoff_seconds=15 * 60)
+            # NOT a retry, as of 3 Sep 2026. resolve_property returns None
+            # only when every lookup ANSWERED SUCCESSFULLY and simply had
+            # no match for this project name - a transport/HTTP failure
+            # raises instead and is caught below, where a retry genuinely
+            # helps. So None is a PERMANENT condition: the project isn't
+            # in the Indihomes catalogue under any name we can match, and
+            # retrying the identical lookup 3 more times over ~80 minutes
+            # cannot change that. It only delays the human who actually
+            # has to deal with it.
+            #
+            # Measured over the 67 real leads from 25 Aug - 3 Sep 2026,
+            # this path fired for 25 of them (project genuinely not
+            # stocked: Narang Vivenda, L And T Ahana Tower A, Sahakar
+            # Revanta, Runwal Auris Serenity Tower 4 Residential) - i.e.
+            # ~75 wasted lookup rounds, and every one of those leads
+            # reached an advisor over an hour later than it needed to.
+            logger.warning(
+                "Lead %s: no catalogue match for project_name=%r (project_code=%s) - notifying advisor "
+                "immediately instead of retrying an identical lookup 3 more times",
+                lead.id, lead.project_name, lead.project_code,
+            )
+            notify_service.notify_advisor(NotifyAdvisorRequest(
+                phone=lead.phone,
+                name=lead.name or "",
+                project_code=lead.project_code,
+                project_name=lead.project_name,
+                reason="unresolved_project",
+                lead_source=lead.lead_source,
+            ))
+            record.status = CampaignStatus.ADVISOR_NOTIFIED
             return record
         record.status = CampaignStatus.PROPERTY_RESOLVED
 

@@ -26,6 +26,7 @@ CRM data itself has nothing to search on. This should be rare now that
 EOI/Meta Ads leads (which never have project data) are classified as
 Generic Interest instead and never reach process_lead at all.
 """
+from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from integrations.indihomes_client import get_indihomes_client
@@ -59,6 +60,33 @@ _MAX_FUTURE_SKEW = timedelta(minutes=10)
 # redeploys is a known, currently-accepted tradeoff, not yet a problem
 # at this service's lead volume.
 _processed_lead_ids: set[str] = set()
+
+# Rolling record of what actually happened to the last N leads, exposed
+# by GET /debug/pipeline. Added 3 Sep 2026 after an incident where the
+# service ran healthily for five days while sending nothing, and the
+# only way to find out why would have been Railway log history that had
+# already rolled off (its UI serves ~1000 lines, about 3 hours at this
+# service's poll rate). One HTTP call now answers "what happened to the
+# last 50 leads" without needing logs at all. In-memory, resets on
+# restart - same accepted tradeoff as _processed_lead_ids above.
+_recent_outcomes: deque = deque(maxlen=50)
+
+
+def recent_outcomes() -> list[dict]:
+    """Newest first. Read by routes/health.py's /debug/pipeline."""
+    return list(reversed(_recent_outcomes))
+
+
+def _record_outcome(lead, record) -> None:
+    _recent_outcomes.append({
+        "at": datetime.now(timezone.utc).isoformat(),
+        "lead_id": lead.id,
+        "phone": lead.phone,
+        "project_name": lead.project_name,
+        "lead_date": lead.timestamp,
+        "status": record.status,
+        "last_error": record.last_error,
+    })
 
 
 def _parse_ts(ts: str) -> datetime | None:
@@ -119,6 +147,7 @@ def _summarize_and_queue(records, leads, processor, indihomes_client=None, wati_
     schedules."""
     sent = queued = notified = queued_off_hours = 0
     for lead, record in zip(leads, records):
+        _record_outcome(lead, record)
         if record.status == CampaignStatus.TEMPLATE_SENT:
             sent += 1
         elif record.status == CampaignStatus.RETRYING:

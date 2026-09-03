@@ -36,6 +36,7 @@ Vincere" when looking for "Ariha Opulence", forgiving enough to accept
 "Ariha  Opulence " when looking for "Ariha Opulence".
 """
 import re
+import time
 from typing import Any, Optional
 
 from integrations.indihomes_client import IndihomesClient
@@ -122,6 +123,96 @@ def _normalize_for_match(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip().lower()
 
 
+# --- Tier 4: partial (contained) name matching -------------------------
+#
+# Added 3 Sep 2026 after a real production audit. Every Housing.com lead
+# arrives with projectCode=None, so resolution depends ENTIRELY on
+# projectName matching an Indihomes displayName. Housing.com and the
+# Indihomes catalogue name the same building differently, in two
+# predictable directions:
+#
+#   lead name is LONGER  - "Mahindra Marina 64 Phase 3" vs catalogue
+#                          "Mahindra Marina" (tower/phase suffix)
+#   lead name is SHORTER - "Treesourus" vs "Chandak Treesourus",
+#                          "38 Avenue" vs "38 Avenue By Artha Lifespaces "
+#                          (builder prefix / suffix)
+#
+# Measured over the 67 real leads from 25 Aug - 3 Sep 2026: 14 of them
+# (21%) failed resolution for exactly this reason, each burning 3
+# retries over ~80 minutes before being abandoned.
+#
+# Deliberately NOT plain substring matching. Two guards keep this from
+# ever attaching the wrong building to a real customer:
+#
+#   1. WHOLE-TOKEN, CONTIGUOUS containment - "One Vara" can never match
+#      inside "Stone Varanasi", because tokens are compared as tokens.
+#   2. A LENGTH FLOOR on the shorter side (_MIN_CONTAINMENT_CHARS) - a
+#      short generic name like "Astral" is not distinctive enough to
+#      claim a longer name that happens to contain it.
+#
+# And the caller requires the match to be UNIQUE across the catalogue:
+# two candidates matching means we don't know which, so we resolve
+# nothing rather than guess. Verified against the full live catalogue
+# (153 projects, 3 Sep 2026): zero project name matches any other
+# project under this rule.
+_MIN_CONTAINMENT_CHARS = 8
+
+
+def _match_tokens(text: str) -> list[str]:
+    return _normalize_for_match(text).split()
+
+
+def _is_contiguous_run(short: list[str], long: list[str]) -> bool:
+    """True if `short` appears as a contiguous run of whole tokens in
+    `long`. Contiguous (not merely "all words present") so "Marina
+    Mahindra Heights" doesn't match "Mahindra Marina"."""
+    n = len(short)
+    if not n or n > len(long):
+        return False
+    return any(long[i:i + n] == short for i in range(len(long) - n + 1))
+
+
+def names_contain(a: str, b: str) -> bool:
+    """True if one name's tokens sit contiguously inside the other's and
+    the shorter side is long enough to be distinctive. Symmetric - the
+    lead name can be either the longer or the shorter of the pair (see
+    the two directions in the block comment above)."""
+    ta, tb = _match_tokens(a), _match_tokens(b)
+    if not ta or not tb:
+        return False
+    short, long = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    if len(" ".join(short)) < _MIN_CONTAINMENT_CHARS:
+        return False
+    return _is_contiguous_run(short, long)
+
+
+# The full catalogue is ~150 projects and changes rarely, so it's fetched
+# once and reused rather than re-pulled on every 45-second poll cycle.
+# Cached in-process only (same tradeoff already accepted for
+# retry_worker's queue and campaign_worker's _processed_lead_ids) - a
+# restart just re-fetches it.
+_ALL_PROJECTS_TTL_SECONDS = 600
+_all_projects_cache: tuple[float, list[dict]] | None = None
+
+
+async def _all_projects(client: IndihomesClient) -> list[dict]:
+    global _all_projects_cache
+    now = time.monotonic()
+    if _all_projects_cache and now - _all_projects_cache[0] < _ALL_PROJECTS_TTL_SECONDS:
+        return _all_projects_cache[1]
+    projects = await client.fetch_filtered_projects({"limit": 300})
+    if projects:
+        # Only cache a non-empty result: an empty list is far more likely
+        # to be a transient backend hiccup than a genuinely empty
+        # catalogue, and caching it would blind resolution for 10 minutes.
+        _all_projects_cache = (now, projects)
+    return projects
+
+
+def _display_name(candidate: dict) -> str:
+    return candidate.get("displayName") or candidate.get("projectName") or ""
+
+
 def raw_to_property(raw: dict, fallback_code: str = "", fallback_name: str = "") -> Property:
     """Turns the backend's raw project JSON (from /fetchProject,
     /fetchProjectByName, or /fetchPaginatedFilteredProjectList) into a
@@ -186,6 +277,40 @@ async def resolve_raw_project(client: IndihomesClient, code: Optional[str], name
                     name, display, len(candidates),
                 )
                 break
+
+    if raw is None and name:
+        # Tier 4 - partial (contained) name match against the FULL
+        # catalogue. See the _MIN_CONTAINMENT_CHARS block comment above
+        # for why this exists and what stops it guessing wrong.
+        #
+        # Runs against the whole catalogue rather than a searchText
+        # result on purpose: tier 3's search is a literal substring
+        # match on the FIRST WORD, which is useless in exactly the cases
+        # this tier is for ("L And T Ahana Tower A" searches for "L" and
+        # returns most of the catalogue; "Chandak Treesourus" is never
+        # returned by a search for a lead named "Treesourus" only if the
+        # limit truncates it). One cached call is both cheaper and more
+        # complete.
+        all_projects = await _all_projects(client)
+        matches = [c for c in all_projects if names_contain(name, _display_name(c))]
+        if len(matches) == 1:
+            raw = matches[0]
+            logger.info(
+                "Resolved project via partial-name match for name=%r -> display=%r (catalogue of %d)",
+                name, _display_name(raw), len(all_projects),
+            )
+        elif len(matches) > 1:
+            logger.warning(
+                "Partial-name match for name=%r was AMBIGUOUS (%s) - refusing to guess, "
+                "treating as unresolved so a human decides",
+                name, [_display_name(c) for c in matches],
+            )
+        else:
+            logger.info(
+                "No catalogue project matches name=%r, exactly or partially (catalogue of %d) - "
+                "this project is most likely not stocked by Indihomes at all",
+                name, len(all_projects),
+            )
 
     return raw
 

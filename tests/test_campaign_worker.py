@@ -185,18 +185,26 @@ async def test_run_cycle_does_not_advance_checkpoint_on_empty_batch(patch_client
 
 
 @pytest.mark.asyncio
-async def test_run_cycle_queues_failed_lead_for_retry_but_still_advances_checkpoint(patch_clients):
+async def test_run_cycle_still_advances_checkpoint_when_a_lead_cannot_be_resolved(patch_clients):
+    """CHANGED 3 Sep 2026: an unresolvable project no longer enters the
+    retry queue (see test_templates.py's
+    test_process_lead_notifies_advisor_when_property_unresolved for
+    why). What this test is actually guarding - that a lead the cycle
+    could NOT send to still advances the checkpoint, so one bad lead
+    can never wedge the poller - is unchanged and is what's asserted."""
     leads = [
         {"_id": "1", "phone": "9876543210", "lead_source": "Housing.com", "projectCode": "MISSING",
          "leadDate": "2026-07-30T13:00:00.000Z"},
     ]
-    indihomes = FakeIndihomesClient(leads=leads, project=None)  # property never resolves -> failure
-    patch_clients(indihomes=indihomes, wati=FakeWatiClient())
+    indihomes = FakeIndihomesClient(leads=leads, project=None)  # property never resolves
+    wati = FakeWatiClient()
+    patch_clients(indihomes=indihomes, wati=wati)
 
     await campaign_worker.run_cycle()
 
     assert checkpoint.get_after_date() == "2026-07-30T13:00:00.000Z"
-    assert retry_worker.pending_count() == 1
+    assert retry_worker.pending_count() == 0
+    assert wati.sent_templates == []
 
 
 @pytest.mark.asyncio
