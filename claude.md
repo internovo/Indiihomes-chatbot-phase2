@@ -1255,3 +1255,106 @@ send, `ok` after a 200, `REJECTED` + an ERROR log naming the cause on
 401 and on 403, a 500 explicitly NOT reported as an auth problem (so
 nobody chases a token that is fine), and both `/health` and
 `/debug/pipeline` carrying the field. 124 tests passing overall.
+
+---
+
+# TASK: `POST /admin/replay` - recovering the leads the outage dropped
+
+## Why this exists rather than `scripts/reprocess_lead.py`
+
+17 leads were never messaged between 28 Aug and 3 Sep. They cannot come
+back on their own: `retry_worker`'s queue is in-memory and was lost on
+restart, and the checkpoint has advanced past their `leadDate`, so
+`campaign_worker` will never fetch them again.
+
+`scripts/reprocess_lead.py` already does this job, and was the obvious
+choice - but its own docstring documents the disqualifying catch: it
+runs on whoever's laptop invokes it, so `campaign_context.remember()`
+writes to THAT process's memory, not the deployed service's. The
+deployed service is what WATI calls back on `/property-detail` when the
+customer taps the button, so a locally-replayed lead sees blank
+`{{project_name}}` placeholders the moment they engage. For a recovery
+run aimed at re-engaging exactly the people we already failed once,
+that is the wrong trade. Running inside the deployed process makes
+campaign_context correct for free.
+
+## Safety design
+
+This is the only endpoint in the service that can message people in
+bulk, so it is also the only authenticated one:
+
+1. **Explicit allow-list.** Replays only the `lead_ids` named in the
+   body. There is deliberately no "replay everything since X" mode - a
+   rewind-the-checkpoint design would put mass re-messaging one typo
+   away.
+2. **Dry run by default.** Without `"confirm": true` it resolves each
+   lead and reports what WOULD happen, sending nothing.
+3. **Shared secret.** `X-Admin-Secret` must match `ADMIN_SECRET`.
+   Unset `ADMIN_SECRET` returns **503**, so an unconfigured deployment
+   is closed rather than open.
+4. **Idempotent.** Calls the same `campaign_service.process_lead` the
+   normal cycle does, so `sent_template_store` still blocks a second
+   send to anyone already messaged, and the business-hours gate still
+   applies (off-hours leads queue instead of sending).
+5. Never touches the checkpoint.
+
+**Unset `ADMIN_SECRET` in Railway once a recovery is finished.** The
+endpoint has no business being live between incidents.
+
+## Choosing WHO to replay - the part that isn't code
+
+42 leads arrived after the last successful send. Only 17 were
+messageable, and working out which is a judgement call worth recording:
+
+- **16 had no matching project at all** (Narang Vivenda, L And T Ahana
+  Tower A, Sahakar Revanta, Runwal Auris Serenity Tower 4 Residential).
+  Indihomes does not stock these - there is no property template to
+  send. Advisors were already notified. Not a bug, nothing to replay.
+- **9 had already been worked and closed by advisors** - "Fake Lead /
+  Customer Declined", "Out of Geo Limit", "Not Interested", "Closed /
+  Broker/CP". Messaging someone who declined on a call reads as broken
+  software and invites a WhatsApp block, which damages the sender
+  quality rating for every future campaign. Excluded.
+- **1 more excluded on a second pass**: "Amol Bansode" appears as two
+  CRM records with the SAME phone (8433579534) - one blank, one marked
+  Fake Lead / Customer Declined. Filtering on lead status alone would
+  have messaged the blank one and reached a person an advisor had
+  already closed. **A duplicate-phone check belongs in this decision,
+  not just a status check** - worth remembering next time.
+
+Net: 16 sent.
+
+## Usage
+
+```powershell
+$secret = "<ADMIN_SECRET as set in Railway>"
+$url = "https://indiihomes-chatbot-phase2-production.up.railway.app/admin/replay"
+$ids = @("housing_...", "housing_...")
+
+# 1. DRY RUN first - always. Sends nothing.
+$body = @{ after="2026-08-28T09:12:00.000Z"; lead_ids=$ids; confirm=$false } | ConvertTo-Json
+Invoke-RestMethod -Uri $url -Method Post -ContentType "application/json" `
+  -Headers @{"X-Admin-Secret"=$secret} -Body $body | ConvertTo-Json -Depth 5
+
+# 2. Only after reading that output: send for real.
+$body = @{ after="2026-08-28T09:12:00.000Z"; lead_ids=$ids; confirm=$true } | ConvertTo-Json
+Invoke-RestMethod -Uri $url -Method Post -ContentType "application/json" `
+  -Headers @{"X-Admin-Secret"=$secret} -Body $body | ConvertTo-Json -Depth 5
+```
+
+`after` must be early enough that `get-new-leads` still returns the
+leads being replayed - the endpoint filters that window down to the
+allow-list, so a generous window costs nothing.
+
+## Testing
+
+`tests/test_admin_replay.py` (new, 7 tests). Most of them assert what
+it REFUSES to do: 503 with no secret configured, 401 on a missing/wrong
+secret, dry-run-by-default sending nothing, and - the core safety
+property - that a lead present in the fetched window but NOT named in
+`lead_ids` is never messaged. Plus: unknown ids reported rather than
+silently dropped, replayed leads marked in `_processed_lead_ids`, and a
+dry run surviving a lookup that raises (a preview exists to show all 17
+at once; one bad lookup must not 500 the batch and hide the other 16).
+
+132 tests passing overall.

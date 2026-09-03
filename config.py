@@ -126,6 +126,13 @@ class Settings(BaseSettings):
     os_events_dry_run: bool = True
     os_events_timeout_seconds: int = 10
 
+    # --- Admin / incident recovery (see routes/admin.py) ---
+    # Shared secret for POST /admin/replay, the ONLY endpoint in this
+    # service that can message people in bulk. Blank = that endpoint
+    # returns 503, so an unconfigured deployment is closed rather than
+    # open. Env var: ADMIN_SECRET.
+    admin_secret: str = ""
+
     # --- Misc ---
     log_level: str = "INFO"
     environment: str = "development"
