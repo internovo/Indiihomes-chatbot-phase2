@@ -37,14 +37,11 @@ from typing import Optional
 
 from models.lead import Lead
 from utils.logger import get_logger
+from utils.state_dir import state_path
 
 logger = get_logger("pending_queue")
 
-_PENDING_QUEUE_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "state",
-    "pending_queue.json",
-)
+_PENDING_QUEUE_PATH = state_path("pending_queue.json")
 
 
 def _read_raw() -> dict:

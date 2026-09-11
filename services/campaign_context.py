@@ -29,14 +29,11 @@ import json
 import os
 
 from utils.logger import get_logger
+from utils.state_dir import state_path
 
 logger = get_logger("campaign_context")
 
-_CONTEXT_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "state",
-    "campaign_context.json",
-)
+_CONTEXT_PATH = state_path("campaign_context.json")
 
 # In-memory cache - populated on first access from disk, then kept
 # in sync by remember(). Never cleared in production code paths.

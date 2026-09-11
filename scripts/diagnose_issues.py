@@ -35,6 +35,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from utils.state_dir import state_path
+
 import httpx  # noqa: E402
 
 from config import get_settings  # noqa: E402
@@ -52,10 +54,7 @@ def _check_ledger(lead_id: str) -> None:
     print(f"[1] DISK LEDGER CHECK for lead_id={lead_id!r}")
     print(SECTION)
 
-    ledger_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "state", "sent_templates.json"
-    )
+    ledger_path = state_path("sent_templates.json")
     print(f"Ledger path: {ledger_path}")
     if not os.path.exists(ledger_path):
         print("!! state/sent_templates.json does NOT EXIST.")
@@ -91,10 +90,7 @@ def _dump_ledger() -> None:
     print("[LEDGER DUMP] Full state/sent_templates.json contents")
     print(SECTION)
 
-    ledger_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "state", "sent_templates.json"
-    )
+    ledger_path = state_path("sent_templates.json")
     if not os.path.exists(ledger_path):
         print("!! state/sent_templates.json does NOT EXIST yet.")
         print("   Expected/normal if nothing's been sent since this container started -")
@@ -239,10 +235,7 @@ async def _check_campaign_context_store() -> None:
     print("  ✅ campaign_context.py HAS disk-persistence code (_CONTEXT_PATH present) -")
     print("     the fix IS in this deployment's code, regardless of what's below.")
 
-    context_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "state", "campaign_context.json"
-    )
+    context_path = state_path("campaign_context.json")
     if os.path.exists(context_path):
         print(f"\n  ✅ Persisted context store found at {context_path}")
         with open(context_path, "r", encoding="utf-8") as f:
