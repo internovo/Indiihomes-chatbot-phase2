@@ -24,14 +24,11 @@ import os
 from datetime import datetime, timezone
 
 from utils.logger import get_logger
+from utils.state_dir import state_path
 
 logger = get_logger("opted_out_store")
 
-_OPTED_OUT_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "state",
-    "opted_out.json",
-)
+_OPTED_OUT_PATH = state_path("opted_out.json")
 
 
 def _read_raw() -> dict:

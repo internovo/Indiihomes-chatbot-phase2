@@ -10,14 +10,11 @@ import os
 from datetime import datetime, timezone
 
 from utils.logger import get_logger
+from utils.state_dir import state_path
 
 logger = get_logger("sent_template_store")
 
-_SENT_TEMPLATES_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "state",
-    "sent_templates.json",
-)
+_SENT_TEMPLATES_PATH = state_path("sent_templates.json")
 
 
 def _key(lead_id: str, template_name: str) -> str:

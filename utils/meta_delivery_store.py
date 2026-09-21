@@ -61,14 +61,11 @@ from typing import Optional
 
 from models.lead import Lead
 from utils.logger import get_logger
+from utils.state_dir import state_path
 
 logger = get_logger("meta_delivery_store")
 
-_STORE_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "state",
-    "meta_delivery_status.json",
-)
+_STORE_PATH = state_path("meta_delivery_status.json")
 
 
 class DeliveryStatus:

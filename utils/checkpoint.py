@@ -11,10 +11,11 @@ from datetime import datetime, timedelta, timezone
 
 from config import get_settings
 from utils.logger import get_logger
+from utils.state_dir import state_path
 
 logger = get_logger("checkpoint")
 
-_CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "state", "checkpoint.json")
+_CHECKPOINT_PATH = state_path("checkpoint.json")
 
 
 def _read_raw() -> dict:
