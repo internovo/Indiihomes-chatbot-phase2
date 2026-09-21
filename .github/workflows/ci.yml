@@ -1,0 +1,68 @@
+# CI for the Phase 2 campaign service. Tests only - this workflow does NOT deploy.
+#
+# It used to deploy to an Azure App Service staging slot
+# (azure/webapps-deploy@v3, app "indihomes-chatbot-phase2", then a manual
+# slot swap). That was written before the target was settled and never
+# worked: production is a bare Ubuntu VM (indihomes-prod-az) running
+# uvicorn under systemd behind nginx, and no App Service by that name
+# exists in the subscription - the only two are
+# indihomes-lead-routing-service and app-propog-api, neither of which is
+# this app. On merge the job would fail at azure/login or
+# azure/webapps-deploy, which is noise, and if an App Service with that
+# name were ever created it would start shipping there instead of to the
+# live VM. Removed rather than left to rot.
+#
+# There is a second reason this service must never gain push-button CD:
+# two schedulers polling the same lead feed double-send to real customers.
+# Any future automation has to stop the old instance before starting the
+# new one, which a slot swap does not guarantee.
+#
+# How production is actually deployed today (manual, from a workstation
+# with the VM's SSH key):
+#
+#   git archive --format=tar HEAD > /tmp/p2.tar
+#   scp /tmp/p2.tar azureuser@<vm>:/tmp/
+#   ssh azureuser@<vm> 'cd /opt/indihomes-phase2 && tar -xf /tmp/p2.tar'
+#   ssh azureuser@<vm> 'cd /opt/indihomes-phase2 && .venv/bin/python -m pytest -q'
+#   # then, only once the nginx log shows no request in the last 60s:
+#   ssh azureuser@<vm> 'sudo systemctl restart indihomes-phase2'
+#
+# Only tracked files ship, so .env and credentials never leave the VM, and
+# persistent state lives outside the source tree at
+# INDIHOMES_STATE_DIR=/data/phase2-state - see utils/state_dir.py for why
+# that separation is load-bearing.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run test suite
+        # Every outbound call is mocked (httpx.MockTransport), so no WATI
+        # key, Brevo key or CRM access is needed. Keep it that way.
+        run: python -m pytest -q
