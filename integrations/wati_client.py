@@ -69,6 +69,44 @@ def auth_status() -> dict:
     return dict(_auth_state)
 
 
+class WatiSendRejected(RuntimeError):
+    """WATI answered 2xx but refused to send.
+
+    Raised so a rejected send takes the SAME path as an HTTP error:
+    campaign_service's `except Exception` marks the record failed with a
+    backoff and the retry worker picks it up - crucially WITHOUT reaching
+    sent_template_store.mark_sent(), which is permanent and would make
+    has_sent() skip that lead forever.
+    """
+
+
+def _body_says_ok(data) -> tuple:
+    """(ok, info) for a WATI 2xx response body.
+
+    WATI reports a refused send inside a 200, not with a status code:
+    {"result": false, "info": "Check your template, it cannot have typos
+    or blank text"}. That exact body came back on EVERY v1 template send
+    in Aug 2026 (see this module's docstring) and nothing read it, so the
+    leads were recorded as sent and never messaged.
+
+    Success shapes vary by endpoint - {"result": true},
+    {"result": "success"}, and {"ok": true, "errors": [], ...} are all
+    real - so this keys off explicit FAILURE markers only. An unparseable
+    or unrecognised body counts as success: a response-shape change must
+    never convert real deliveries into permanent retry failures.
+    """
+    if not isinstance(data, dict):
+        return True, ""
+    info = str(data.get("info") or data.get("error") or "").strip()
+    result = data.get("result")
+    if result is False or (isinstance(result, str)
+                           and result.strip().lower() in ("false", "failed", "error")):
+        return False, info or "result=false"
+    if data.get("ok") is False:
+        return False, info or "ok=false"
+    return True, ""
+
+
 class WatiClient:
     def __init__(self):
         settings = get_settings()
@@ -104,7 +142,18 @@ class WatiClient:
                 )
             resp.raise_for_status()
             _note_auth(True)
-            return resp.json()
+            body = resp.json()
+            ok, info = _body_says_ok(body)
+            if not ok:
+                # 2xx but refused. Must NOT return normally: the caller
+                # marks the lead as sent immediately after this await, and
+                # that record is permanent (see WatiSendRejected).
+                logger.error(
+                    "WATI refused the template send for %s (HTTP %s, template %s): %s",
+                    phone, resp.status_code, template_name, info,
+                )
+                raise WatiSendRejected(info)
+            return body
 
     @with_retry(attempts=2)
     async def send_message(self, phone: str, message: str) -> dict:
